@@ -348,9 +348,12 @@ fi
 
 # Build the effective measured kernel command line. Adding the UUID produces
 # a different launch measurement from the unsealed boot; verifiers pin the
-# exact variant they expect.
+# exact variant they expect. The sealed cmdline format is defined in
+# sealed-cmdline.sh — shared with the release workflow and verify-build.sh
+# so the measurement is reproducible byte-for-byte.
 if [[ -n "$LUKS_UUID" ]]; then
-    KERNEL_CMDLINE="${KERNEL_CMDLINE} KATANA_EXPECTED_LUKS_UUID=${LUKS_UUID}"
+    . "${SCRIPT_DIR}/sealed-cmdline.sh"
+    KERNEL_CMDLINE="$(build_sealed_cmdline "$LUKS_UUID")"
 fi
 
 echo ""
