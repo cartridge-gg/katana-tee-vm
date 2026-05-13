@@ -45,12 +45,13 @@ default-features = false
 features = [ "openssl", "snp" ]
 git = "https://github.com/virtee/sev"
 
-# Vendored from katana/crates/tee — required only by snp-derivekey. Matches the
-# pin in katana's workspace Cargo.toml. snp-derivekey is the only consumer of
-# this crate's API (SevSnp + DerivedKeyOptions); keep that scope tight.
+# Vendored from katana/crates/tee — required only by snp-derivekey. Pinned to
+# the exact rev katana's Cargo.lock validates against, so our snp-derivekey
+# behaves identically to katana's (this crate implements the SNP_GET_DERIVED_KEY
+# ioctl that derives the disk-unsealing key — drift would silently rotate keys).
 [dependencies.sev-snp]
-branch = "main"
 default-features = false
 features = [ "configfs", "legacy" ]
 git = "https://github.com/automata-network/amd-sev-snp-attestation-sdk"
+rev = "07162a4dd8d692af68484084b972f8b9b286359b"
 optional = true

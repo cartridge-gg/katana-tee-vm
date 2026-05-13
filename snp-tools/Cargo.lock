@@ -1228,7 +1228,7 @@ dependencies = [
 [[package]]
 name = "sev-snp"
 version = "0.3.0"
-source = "git+https://github.com/automata-network/amd-sev-snp-attestation-sdk?branch=main#a81cf8164b9618206258ccce966964ccbd8ed616"
+source = "git+https://github.com/automata-network/amd-sev-snp-attestation-sdk?rev=07162a4dd8d692af68484084b972f8b9b286359b#07162a4dd8d692af68484084b972f8b9b286359b"
 dependencies = [
  "asn1-rs",
  "bincode",
