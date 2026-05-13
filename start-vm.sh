@@ -352,7 +352,7 @@ fi
 # sealed-cmdline.sh — shared with the release workflow and verify-build.sh
 # so the measurement is reproducible byte-for-byte.
 if [[ -n "$LUKS_UUID" ]]; then
-    . "${SCRIPT_DIR}/sealed-cmdline.sh"
+    . "${SCRIPT_DIR}/scripts/sealed-cmdline.sh"
     KERNEL_CMDLINE="$(build_sealed_cmdline "$LUKS_UUID")"
 fi
 

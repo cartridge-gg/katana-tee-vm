@@ -114,7 +114,7 @@ jobs:
       - name: Compute sealed launch measurement
         run: |
           . ./build-config
-          . ./sealed-cmdline.sh
+          . ./scripts/sealed-cmdline.sh
           LUKS_UUID="$KATANA_CANONICAL_LUKS_UUID"
           # Validate canonical UUID format (matches start-vm.sh:174).
           if [[ ! "$LUKS_UUID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then

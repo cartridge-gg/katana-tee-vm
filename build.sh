@@ -219,7 +219,7 @@ if [ $BUILD_INITRD -eq 1 ] \
 	if [ ! -x "$CRYPTSETUP_BINARY" ] || [ ! -x "$MKFS_EXT2_BINARY" ]; then
 		echo ""
 		echo "Building static cryptsetup + mkfs.ext2 (sealed-storage helpers)..."
-		"${SCRIPT_DIR}/build-cryptsetup.sh" "$CRYPTSETUP_OUT_DIR" || {
+		"${SCRIPT_DIR}/scripts/build-cryptsetup.sh" "$CRYPTSETUP_OUT_DIR" || {
 			echo "build-cryptsetup.sh failed"
 			exit 1
 		}
@@ -246,7 +246,7 @@ INSTALL_DIR=$(readlink -e $INSTALL_DIR)
 }
 
 if [ $BUILD_OVMF -eq 1 ]; then
-	"${SCRIPT_DIR}/build-ovmf.sh" "$INSTALL_DIR"
+	"${SCRIPT_DIR}/scripts/build-ovmf.sh" "$INSTALL_DIR"
 	if [ $? -ne 0 ]; then
 		echo "OVMF build failed: $?"
 		exit 1
@@ -254,7 +254,7 @@ if [ $BUILD_OVMF -eq 1 ]; then
 fi
 
 if [ $BUILD_KERNEL -eq 1 ]; then
-	"${SCRIPT_DIR}/build-kernel.sh" "$INSTALL_DIR"
+	"${SCRIPT_DIR}/scripts/build-kernel.sh" "$INSTALL_DIR"
 	if [ $? -ne 0 ]; then
 		echo "Kernel build failed: $?"
 		exit 1
@@ -262,7 +262,7 @@ if [ $BUILD_KERNEL -eq 1 ]; then
 fi
 
 if [ $BUILD_INITRD -eq 1 ]; then
-	"${SCRIPT_DIR}/build-initrd.sh" "$KATANA_BINARY" "$INSTALL_DIR/initrd.img"
+	"${SCRIPT_DIR}/scripts/build-initrd.sh" "$KATANA_BINARY" "$INSTALL_DIR/initrd.img"
 	if [ $? -ne 0 ]; then
 		echo "Initrd build failed: $?"
 		exit 1

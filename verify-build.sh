@@ -129,8 +129,8 @@ else
         exit 1
     fi
 
-    # shellcheck source=sealed-cmdline.sh
-    . "${SCRIPT_DIR}/sealed-cmdline.sh"
+    # shellcheck source=scripts/sealed-cmdline.sh
+    . "${SCRIPT_DIR}/scripts/sealed-cmdline.sh"
     CMDLINE="$(build_sealed_cmdline "$LUKS_UUID")"
     COMPUTED_MEASUREMENT=$("$SNP_DIGEST" \
         --ovmf="$OUTPUT_DIR/OVMF.fd" \

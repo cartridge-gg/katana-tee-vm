@@ -7,7 +7,7 @@ Build scripts for creating TEE (Trusted Execution Environment) components to run
 - **QEMU 10.2.0** - Only tested with this version. Earlier versions may lack required SEV-SNP features.
   ```sh
   # Build from source using the provided script
-  ./misc/AMDSEV/build-qemu.sh
+  ./scripts/build-qemu.sh
   ```
 - AMD EPYC processor with SEV-SNP support
 - Host kernel with SEV-SNP enabled
@@ -15,37 +15,39 @@ Build scripts for creating TEE (Trusted Execution Environment) components to run
 ## Quick Start
 
 ```sh
-# From repository root - builds everything (OVMF, kernel, katana, initrd)
-./misc/AMDSEV/build.sh
-
-# Or with a pre-built Linux glibc katana binary
-./misc/AMDSEV/build.sh --katana /path/to/katana
+# Build everything (OVMF, kernel, initrd) with a prebuilt katana binary.
+# Download katana from https://github.com/dojoengine/katana/releases.
+./build.sh --katana /path/to/katana
 ```
 
-Output is written to `misc/AMDSEV/output/qemu/`.
+Output is written to `output/qemu/`.
 
 ### Katana Binary
 
-If `--katana` is not provided, `build.sh` prompts for confirmation (`y/N`) before building a normal dynamically linked Linux glibc binary via `scripts/build-gnu.sh`.
+`--katana` is required when building the initrd. Download a prebuilt linux-gnu binary from [dojoengine/katana releases](https://github.com/dojoengine/katana/releases) (the `*_linux_amd64.tar.gz` portable build).
 
-For reproducibility, the initrd does not copy glibc or shared libraries from the build host. Instead, `build-initrd.sh` downloads the exact runtime `.deb` packages listed in `build-config`, verifies their SHA-256 checksums, then copies the ELF interpreter and the shared libraries declared by Katana with `readelf`. If providing a custom dynamic binary with `--katana`, build it against a glibc compatible with the pinned runtime and make sure any extra shared libraries it needs are covered by `GLIBC_RUNTIME_PACKAGES` and `GLIBC_RUNTIME_PACKAGE_SHA256S`.
+For reproducibility, the initrd does not copy glibc or shared libraries from the build host. Instead, `scripts/build-initrd.sh` downloads the exact runtime `.deb` packages listed in `build-config`, verifies their SHA-256 checksums, then copies the ELF interpreter and the shared libraries declared by Katana with `readelf`. If providing a custom dynamic binary with `--katana`, build it against a glibc compatible with the pinned runtime and make sure any extra shared libraries it needs are covered by `GLIBC_RUNTIME_PACKAGES` and `GLIBC_RUNTIME_PACKAGE_SHA256S`.
 
-## Scripts
+## Layout
 
-| Script | Description |
-|--------|-------------|
-| `build.sh` | Main orchestrator - builds all components and generates `build-info.txt` |
-| `build-qemu.sh` | Builds QEMU 10.2.0 from source with SEV-SNP support |
-| `build-ovmf.sh` | Builds OVMF firmware from AMD's fork with SEV-SNP support |
-| `build-kernel.sh` | Downloads and extracts Ubuntu kernel (`vmlinuz`) |
-| `build-initrd.sh` | Creates minimal initrd with busybox, SEV-SNP modules, and katana |
-| `test-initrd.sh` | Runs isolated initrd boot smoke test in plain QEMU |
+| Path | Description |
+|------|-------------|
+| `build.sh` | Orchestrator entry point — builds OVMF, kernel, initrd; writes `build-info.txt` |
+| `start-vm.sh` | Starts a TEE VM with SEV-SNP and launches Katana asynchronously (consumer-facing) |
+| `verify-build.sh` | Verifies sha256s + sealed launch measurement of a build / downloaded release |
 | `build-config` | Pinned versions and checksums for reproducible builds |
-| `start-vm.sh` | Starts a TEE VM with SEV-SNP and launches Katana asynchronously |
+| `scripts/build-ovmf.sh` | Builds OVMF firmware from AMD's fork with SEV-SNP support |
+| `scripts/build-kernel.sh` | Downloads and extracts Ubuntu kernel (`vmlinuz`) |
+| `scripts/build-initrd.sh` | Creates minimal initrd with busybox, SEV-SNP modules, snp-derivekey, cryptsetup, and katana |
+| `scripts/build-cryptsetup.sh` | Builds static cryptsetup + mkfs.ext2 in an Alpine container |
+| `scripts/build-qemu.sh` | Builds QEMU 10.2.0 from source with SEV-SNP support (operator host setup, not part of build pipeline) |
+| `scripts/sealed-cmdline.sh` | Single source of truth for the measured kernel cmdline |
+| `scripts/test-initrd.sh` | Isolated initrd boot smoke test in plain QEMU |
+| `snp-tools/` | Cargo crate with `snp-digest`, `snp-report`, `ovmf-metadata`, `snp-derivekey` |
 
 ## SNP Tools
 
-The `snp-tools` crate (`misc/AMDSEV/snp-tools/`) provides CLI utilities for SEV-SNP development:
+The `snp-tools` crate provides CLI utilities for SEV-SNP development:
 
 | Binary | Description |
 |--------|-------------|
@@ -139,13 +141,13 @@ The `start-vm.sh` script provides an easy way to launch a TEE VM with SEV-SNP en
 
 ```sh
 # Start VM with default boot components (output/qemu/)
-sudo ./misc/AMDSEV/start-vm.sh
+sudo ./start-vm.sh
 
 # Or specify a custom boot components directory
-sudo ./misc/AMDSEV/start-vm.sh /path/to/boot-components
+sudo ./start-vm.sh /path/to/boot-components
 
 # Or customize Katana runtime flags (comma-separated)
-sudo ./misc/AMDSEV/start-vm.sh --katana-args "--http.addr,0.0.0.0,--http.port,5050,--tee,sev-snp,--dev"
+sudo ./start-vm.sh --katana-args "--http.addr,0.0.0.0,--http.port,5050,--tee,sev-snp,--dev"
 ```
 
 The script:
@@ -162,10 +164,10 @@ Use `test-initrd.sh` for focused initrd boot validation without the full SEV-SNP
 
 ```sh
 # Run plain-QEMU boot smoke test
-./misc/AMDSEV/test-initrd.sh
+./scripts/test-initrd.sh
 
 # Custom timeout/output directory
-./misc/AMDSEV/test-initrd.sh --output-dir ./misc/AMDSEV/output/qemu --timeout 300
+./scripts/test-initrd.sh --output-dir ./output/qemu --timeout 300
 ```
 
 ### Launch Measurement Verification
@@ -249,7 +251,7 @@ Use `ovmf-metadata` to inspect the OVMF firmware's SEV metadata sections:
 Set `SOURCE_DATE_EPOCH` for deterministic output:
 
 ```sh
-SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) ./misc/AMDSEV/build.sh
+SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) ./build.sh
 ```
 
 ## Troubleshooting
@@ -272,7 +274,7 @@ When `kernel-hashes=on` is enabled, QEMU needs to inject SHA-256 hashes of the k
 -bios output/qemu/OVMF.fd
 
 # Or rebuild it manually:
-source build-config && ./build-ovmf.sh ./output/qemu
+source build-config && ./scripts/build-ovmf.sh ./output/qemu
 ```
 
 Do not use generic OVMF builds from your distribution or other sources when using `kernel-hashes=on` with SEV-SNP.
