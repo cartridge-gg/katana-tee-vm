@@ -160,6 +160,70 @@ jobs:
           cp output/qemu/build-info.txt "release/build-info-${tag}.txt"
           cp output/qemu/launch-measurement.txt "release/launch-measurement-${tag}.txt"
 
+      - name: Generate release notes
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          katana_ver="${{ steps.katana.outputs.version }}"
+          # Pull values from build-info.txt for the human-readable summary.
+          info_get() {
+            awk -F= -v k="$1" '$1 == k { sub(/^[^=]*=/, ""); print; exit }' output/qemu/build-info.txt
+          }
+          OVMF_SHA="$(info_get OVMF_SHA256)"
+          KERNEL_SHA="$(info_get KERNEL_SHA256)"
+          INITRD_SHA="$(info_get INITRD_SHA256)"
+          KATANA_SHA="$(info_get KATANA_BINARY_SHA256)"
+          LUKS_UUID="$(info_get LUKS_UUID)"
+          LAUNCH_MEASUREMENT="$(info_get LAUNCH_MEASUREMENT)"
+          {
+            echo "# Katana TEE VM ${tag}"
+            echo
+            echo "Sealed-mode SEV-SNP confidential VM image bundling Katana **${katana_ver}**."
+            echo
+            echo "## Sealed launch measurement (SHA-384)"
+            echo
+            echo '```'
+            echo "LUKS_UUID            = ${LUKS_UUID}"
+            echo "LAUNCH_MEASUREMENT   = ${LAUNCH_MEASUREMENT}"
+            echo '```'
+            echo
+            echo "This is the launch measurement that attestation verifiers should compare"
+            echo "against. It is bound to the canonical project-wide \`LUKS_UUID\` from"
+            echo "\`build-config\`. Operators running with a different LUKS_UUID must recompute"
+            echo "their expected measurement via \`./verify-build.sh\` or \`snp-tools/snp-digest\`."
+            echo
+            echo "## Component checksums (SHA-256)"
+            echo
+            echo "| Artifact | SHA-256 |"
+            echo "|---|---|"
+            echo "| \`OVMF.fd\` (guest BIOS firmware) | \`${OVMF_SHA}\` |"
+            echo "| \`vmlinuz\` (kernel)              | \`${KERNEL_SHA}\` |"
+            echo "| \`initrd.img\`                    | \`${INITRD_SHA}\` |"
+            echo "| \`katana\`                        | \`${KATANA_SHA}\` |"
+            echo
+            echo "## Verify before booting"
+            echo
+            echo '```sh'
+            echo "mkdir -p /tmp/katana-tee-vm && tar xzf katana-tee-vm-${tag}.tar.gz -C /tmp/katana-tee-vm"
+            echo "./verify-build.sh /tmp/katana-tee-vm"
+            echo '```'
+            echo
+            echo "The verifier asserts every sha256 above and re-derives the launch measurement"
+            echo "from \`OVMF.fd\` + \`vmlinuz\` + \`initrd.img\` + the canonical LUKS_UUID. Exits"
+            echo "non-zero on any mismatch."
+            echo
+            echo "## Full build provenance"
+            echo
+            echo "<details>"
+            echo "<summary><code>build-info.txt</code></summary>"
+            echo
+            echo '```'
+            cat output/qemu/build-info.txt
+            echo '```'
+            echo
+            echo "</details>"
+          } > release/release-notes.md
+
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -170,6 +234,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
+          body_path: release/release-notes.md
           files: |
             release/katana-tee-vm-*.tar.gz
             release/build-info-*.txt
