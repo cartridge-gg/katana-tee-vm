@@ -75,11 +75,13 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p .katana-dl
-          # TODO(TODOS.md): pin the exact asset name pattern from dojoengine/katana
-          # releases. The current glob is permissive and may match the wrong asset.
+          # dojoengine/katana publishes per-tag: katana_<version>_linux_amd64.tar.gz
+          # (portable) and katana_<version>_linux_amd64_native.tar.gz (CPU-tuned).
+          # We want the portable build — the `_linux_amd64.tar.gz` suffix uniquely
+          # matches it (anchored to end, so it cannot match the `_native` variant).
           gh release download "${{ steps.katana.outputs.version }}" \
             --repo dojoengine/katana \
-            --pattern '*linux*x86_64*.tar.gz' \
+            --pattern '*_linux_amd64.tar.gz' \
             --dir .katana-dl/
           tar -xzf .katana-dl/*.tar.gz -C .katana-dl/
           KATANA_BIN="$(find .katana-dl -type f -name katana -perm -u+x | head -n1)"
