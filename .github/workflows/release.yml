@@ -128,8 +128,9 @@ jobs:
             --initrd=output/qemu/initrd.img \
             --append="$CMDLINE" \
             --vcpus=1 --cpu=epyc-v4 --vmm=qemu --guest-features=0x1)
-          # Validate digest is a 64-char lowercase hex string.
-          if [[ ! "$DIGEST" =~ ^[0-9a-f]{64}$ ]]; then
+          # Validate digest is a 96-char lowercase hex string.
+          # SEV-SNP launch measurement is SHA-384 (48 bytes / 96 hex chars).
+          if [[ ! "$DIGEST" =~ ^[0-9a-f]{96}$ ]]; then
             echo "snp-digest produced unexpected output: $DIGEST" >&2
             exit 1
           fi
