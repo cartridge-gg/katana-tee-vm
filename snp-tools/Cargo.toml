@@ -17,11 +17,25 @@ path = "src/bin/snp-report.rs"
 name = "ovmf-metadata"
 path = "src/bin/ovmf-metadata.rs"
 
+# Run once inside the measured SEV-SNP initrd to derive the disk-unsealing
+# key from SNP_GET_DERIVED_KEY. Linux-only at runtime (ioctl on /dev/sev-guest).
+[[bin]]
+name = "snp-derivekey"
+path = "src/bin/snp-derivekey.rs"
+required-features = [ "snp-derivekey" ]
+
+[features]
+default = [ ]
+# Gates the snp-derivekey binary so non-Linux hosts (developer macOS / CI lint
+# jobs) can `cargo check` snp-tools without pulling the Linux-only sev-snp dep.
+snp-derivekey = [ "dep:sev-snp", "dep:zeroize" ]
+
 [dependencies]
 clap = { version = "4", features = [ "derive" ] }
 hex = "0.4"
 openssl = { version = "0.10", features = [ "vendored" ] }
 tabled = "0.17"
+zeroize = { version = "1.8", optional = true }
 
 # Use git dependency because crates.io v7.1.0 has rdrand as non-optional.
 # The git version has rdrand behind the "sev" feature flag, allowing builds on non-x86_64.
@@ -30,3 +44,13 @@ branch = "main"
 default-features = false
 features = [ "openssl", "snp" ]
 git = "https://github.com/virtee/sev"
+
+# Vendored from katana/crates/tee — required only by snp-derivekey. Matches the
+# pin in katana's workspace Cargo.toml. snp-derivekey is the only consumer of
+# this crate's API (SevSnp + DerivedKeyOptions); keep that scope tight.
+[dependencies.sev-snp]
+branch = "main"
+default-features = false
+features = [ "configfs", "legacy" ]
+git = "https://github.com/automata-network/amd-sev-snp-attestation-sdk"
+optional = true

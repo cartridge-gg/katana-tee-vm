@@ -1,12 +1,13 @@
 #!/bin/bash
 #
 # Build TEE components (OVMF, kernel, initrd) for AMD SEV-SNP.
-# This script should be run from the repository root directory.
 #
 # Usage:
-#   ./misc/AMDSEV/build.sh
-#   ./misc/AMDSEV/build.sh --katana /path/to/katana
-#   ./misc/AMDSEV/build.sh ovmf kernel
+#   ./build.sh --katana /path/to/katana
+#   ./build.sh --katana /path/to/katana ovmf kernel
+#
+# A prebuilt katana binary is required (--katana). Download from:
+#   https://github.com/dojoengine/katana/releases
 #
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -46,7 +47,7 @@ function usage()
 	echo ""
 	echo "OPTIONS:"
 	echo "  --install PATH          Installation path (default: ${SCRIPT_DIR}/output/qemu)"
-	echo "  --katana PATH           Path to katana binary (optional; auto-built if not provided)"
+	echo "  --katana PATH           Path to katana binary (required when building initrd)"
 	echo "  --snp-derivekey PATH    Path to snp-derivekey binary (optional; auto-built if not"
 	echo "                          provided). Required for sealed-mode initrd unless"
 	echo "                          KATANA_UNSEALED_BUILD=1 is set."
@@ -139,66 +140,30 @@ if [ $BUILD_OVMF -eq 0 ] && [ $BUILD_KERNEL -eq 0 ] && [ $BUILD_INITRD -eq 0 ]; 
 	BUILD_INITRD=1
 fi
 
-# Build katana if needed for initrd and not provided
+# A katana binary is required when building the initrd. This standalone repo
+# does not vendor katana source, so the build-from-source fallback that lived
+# here previously has been removed — operators must supply a prebuilt binary
+# with --katana. See dojoengine/katana releases for prebuilt linux-gnu binaries.
 if [ $BUILD_INITRD -eq 1 ] && [ -z "$KATANA_BINARY" ]; then
-	echo "No --katana provided."
-	if [ ! -t 0 ]; then
-		echo "ERROR: Cannot prompt without an interactive terminal."
-		echo "Pass --katana /path/to/katana to use a pre-built binary."
-		exit 1
-	fi
-
-	read -r -p "Build katana from source with glibc now? [y/N] " CONFIRM_BUILD_KATANA
-	case "$CONFIRM_BUILD_KATANA" in
-		[yY]|[yY][eE][sS])
-			echo "Building katana with glibc..."
-			;;
-		*)
-			echo "Aborting. Provide --katana /path/to/katana to use a pre-built binary."
-			exit 1
-			;;
-	esac
-
-	PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-	if ! command -v cargo >/dev/null 2>&1; then
-		echo ""
-		echo "ERROR: cargo is not on PATH."
-		echo ""
-		echo "If you are running build.sh under sudo, cargo is likely installed under your"
-		echo "regular user (\$HOME/.cargo/bin) but not in root's PATH. Two options:"
-		echo ""
-		echo "  1. Pre-build katana as your normal user, then pass the path:"
-		echo "       ${PROJECT_ROOT}/scripts/build-gnu.sh"
-		echo "       sudo $0 --katana \\"
-		echo "         ${PROJECT_ROOT}/target/x86_64-unknown-linux-gnu/performance/katana ..."
-		echo ""
-		echo "  2. Run build.sh with sudo -E to inherit your PATH (assumes cargo on it)."
-		echo ""
-		echo "If cargo is genuinely not installed, set it up via rustup: https://rustup.rs"
-		exit 1
-	fi
-	"${PROJECT_ROOT}/scripts/build-gnu.sh"
-	if [ $? -ne 0 ]; then
-		echo "Katana build failed"
-		exit 1
-	fi
-	KATANA_BINARY="${PROJECT_ROOT}/target/x86_64-unknown-linux-gnu/performance/katana"
-	if [ ! -f "$KATANA_BINARY" ]; then
-		echo "ERROR: Katana binary not found at $KATANA_BINARY"
-		exit 1
-	fi
-	echo "Using built katana: $KATANA_BINARY"
+	echo "ERROR: --katana <path-to-katana-binary> is required when building the initrd."
+	echo ""
+	echo "Download a prebuilt katana binary from:"
+	echo "  https://github.com/dojoengine/katana/releases"
+	echo "and pass it via --katana, e.g.:"
+	echo "  $0 --katana /path/to/katana"
+	exit 1
 fi
 
 # Build snp-derivekey for the canonical sealed initrd unless the operator
-# opted out (KATANA_UNSEALED_BUILD=1) or pre-supplied a binary path. Mirrors
-# the auto-katana flow above; reuses the workspace's musl target so it ships
-# with no runtime libc dependency.
+# opted out (KATANA_UNSEALED_BUILD=1) or pre-supplied a binary path. The
+# source is vendored in this repo's snp-tools workspace (gated behind the
+# `snp-derivekey` feature); built for musl so it ships with no runtime
+# libc dependency.
 if [ $BUILD_INITRD -eq 1 ] \
    && [ "${KATANA_UNSEALED_BUILD:-0}" -ne 1 ] \
    && [ -z "${SNP_DERIVEKEY_BINARY:-}" ]; then
-	PROJECT_ROOT="${PROJECT_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
-	SNP_DERIVEKEY_BINARY="${PROJECT_ROOT}/target/x86_64-unknown-linux-musl/performance/snp-derivekey"
+	SNP_TOOLS_DIR="${SCRIPT_DIR}/snp-tools"
+	SNP_DERIVEKEY_BINARY="${SNP_TOOLS_DIR}/target/x86_64-unknown-linux-musl/release/snp-derivekey"
 	if [ ! -x "$SNP_DERIVEKEY_BINARY" ]; then
 		if ! command -v cargo >/dev/null 2>&1; then
 			echo ""
@@ -208,8 +173,9 @@ if [ $BUILD_INITRD -eq 1 ] \
 			echo "regular user (\$HOME/.cargo/bin) but not in root's PATH. Two options:"
 			echo ""
 			echo "  1. Pre-build snp-derivekey as your normal user, then pass the path:"
-			echo "       cargo build --target x86_64-unknown-linux-musl --profile performance \\"
-			echo "         -p katana-tee --features snp --bin snp-derivekey"
+			echo "       (cd ${SNP_TOOLS_DIR} && cargo build \\"
+			echo "          --locked --target x86_64-unknown-linux-musl --release \\"
+			echo "          --features snp-derivekey --bin snp-derivekey)"
 			echo "       sudo $0 --katana <path> --snp-derivekey \\"
 			echo "         $SNP_DERIVEKEY_BINARY ..."
 			echo ""
@@ -218,12 +184,12 @@ if [ $BUILD_INITRD -eq 1 ] \
 		fi
 		echo ""
 		echo "Building snp-derivekey with musl (sealed-storage helper)..."
-		( cd "$PROJECT_ROOT" && \
+		( cd "$SNP_TOOLS_DIR" && \
 		  cargo build \
 		    --locked \
 		    --target x86_64-unknown-linux-musl \
-		    --profile performance \
-		    -p katana-tee --features snp \
+		    --release \
+		    --features snp-derivekey \
 		    --bin snp-derivekey ) || {
 			echo "snp-derivekey build failed"
 			exit 1
@@ -241,13 +207,12 @@ fi
 # the operator opted out (KATANA_UNSEALED_BUILD=1) or pre-supplied both
 # binary paths. The container build is non-trivial (~2-3 minutes the first
 # time apk-add fetches its mirror), so we cache outputs under
-# $PROJECT_ROOT/target/cryptsetup-static and skip when both binaries are
+# $SCRIPT_DIR/output/cryptsetup-static and skip when both binaries are
 # already present.
 if [ $BUILD_INITRD -eq 1 ] \
    && [ "${KATANA_UNSEALED_BUILD:-0}" -ne 1 ] \
    && { [ -z "${CRYPTSETUP_BINARY:-}" ] || [ -z "${MKFS_EXT2_BINARY:-}" ]; }; then
-	PROJECT_ROOT="${PROJECT_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
-	CRYPTSETUP_OUT_DIR="${PROJECT_ROOT}/target/cryptsetup-static"
+	CRYPTSETUP_OUT_DIR="${SCRIPT_DIR}/output/cryptsetup-static"
 	CRYPTSETUP_BINARY="${CRYPTSETUP_BINARY:-${CRYPTSETUP_OUT_DIR}/cryptsetup}"
 	MKFS_EXT2_BINARY="${MKFS_EXT2_BINARY:-${CRYPTSETUP_OUT_DIR}/mkfs.ext2}"
 

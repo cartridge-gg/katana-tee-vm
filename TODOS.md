@@ -8,10 +8,10 @@
 
 **Context:** Confirm the current asset name with `gh release view --repo dojoengine/katana <latest tag>`. Pin that pattern; consider also verifying the binary's sha256 against the asset's checksum file if katana publishes one.
 
-## Fix build.sh standalone-mode PROJECT_ROOT assumption
+## Pin the `sev-snp` git dependency to a specific revision
 
-**What:** `build.sh` lines 162, 200, 249 compute `PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"`, assuming the script lives at `<katana>/misc/AMDSEV/build.sh`. In this standalone repo `${SCRIPT_DIR}/../..` resolves to the wrong directory (e.g. `/Users/.../cartridge-gg/`).
+**What:** `snp-tools/Cargo.toml`'s `[dependencies.sev-snp]` currently tracks `branch = "main"` of `automata-network/amd-sev-snp-attestation-sdk`. Pin to a specific commit sha (`rev = "..."`) for reproducibility.
 
-**Why:** Today, CI always passes `--katana <path>` so the release path works. But `PROJECT_ROOT` is also used for (a) `scripts/build-gnu.sh` (the build-from-source fallback when `--katana` is omitted), (b) `target/x86_64-unknown-linux-musl/.../snp-derivekey`, and (c) `target/cryptsetup-static` for sealed-storage builds. (b) and (c) still fire and may fail or use stale paths. Local dev without a sibling katana checkout hits this immediately.
+**Why:** `branch = "main"` means a `cargo update` (or a fresh checkout with a stale lockfile) can pull in upstream changes silently. The published launch measurement is reproducible only as long as the snp-derivekey binary itself doesn't drift. The dep is in the runtime-critical path: it implements the SNP ioctl call that derives the disk-unsealing key.
 
-**Context:** Options — require `--katana` always (drop the build-from-source fallback), or accept a `KATANA_REPO=/path` env var to point at an external checkout. Pick one and apply consistently across all three call sites.
+**Context:** Pick a rev once snp-derivekey builds green on CI; record it in `Cargo.toml`. Mirrors how `[dependencies.sev]` should also be pinned (currently also `branch = "main"`).
