@@ -41,6 +41,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Pin SOURCE_DATE_EPOCH to HEAD commit time
+        # Without this, build.sh falls back to `date +%s` and embeds the
+        # wall-clock build time into OVMF + initrd cpio mtimes — producing
+        # different bytes (and a different launch measurement) on every run
+        # of the same source. Anchoring to the commit time makes the published
+        # measurement a function of (commit + katana version + LUKS_UUID),
+        # fully reproducible by anyone rebuilding from the same ref.
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+
       - name: Install build dependencies
         run: |
           sudo apt-get update
