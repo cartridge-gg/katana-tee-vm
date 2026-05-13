@@ -16,11 +16,12 @@ name: Release VM Image
 #   katana-v1.0.0-rc.1         -> katana version v1.0.0-rc.1  (passes through;
 #                                  requires a matching v1.0.0-rc.1 katana release)
 #
-# Runner requirement
-# ------------------
-# SEV-SNP component builds (OVMF, initrd) target an AMD EPYC host with the
-# SEV-SNP-capable toolchain. Configure a self-hosted runner with the labels
-# below, or change `runs-on` to suit your setup.
+# Runner
+# ------
+# Runs on stock `ubuntu-latest`. None of the build steps require AMD SEV-SNP
+# hardware — OVMF is cross-compiled, kernel comes from a Ubuntu .deb,
+# snp-digest is pure userspace hashing. SEV-SNP hardware is only needed at
+# VM-boot time, which is outside this workflow.
 
 on:
   push:
@@ -34,11 +35,25 @@ on:
 
 jobs:
   build:
-    runs-on: [self-hosted, linux, x64, sev-snp]
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          # nasm, iasl, uuid-dev: EDK2 / OVMF build toolchain
+          # musl-tools:           linker for the snp-derivekey musl cross-compile
+          # zstd, cpio:           initrd packaging
+          sudo apt-get install -y --no-install-recommends \
+            nasm iasl uuid-dev \
+            musl-tools \
+            zstd cpio
+
+      - name: Install Rust musl target
+        run: rustup target add x86_64-unknown-linux-musl
 
       - name: Resolve katana version
         id: katana
