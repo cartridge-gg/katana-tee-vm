@@ -98,8 +98,18 @@ jobs:
         # snp-tools binaries are NOT shipped as release artifacts (separate
         # release stream). We build them here only so the next step can run
         # snp-digest to compute the published launch measurement.
+        # snp-tools/.cargo/config.toml pins build.target, so the binary lands
+        # under target/<triple>/release; locate it explicitly rather than
+        # hardcoding the triple here.
         working-directory: snp-tools
-        run: cargo build --release
+        run: |
+          cargo build --release
+          SNP_DIGEST="$(find target -type f -name snp-digest -perm -u+x | head -n1)"
+          if [ -z "$SNP_DIGEST" ]; then
+            echo "snp-digest binary not found after build" >&2
+            exit 1
+          fi
+          echo "SNP_DIGEST=$PWD/$SNP_DIGEST" >> "$GITHUB_ENV"
 
       - name: Compute sealed launch measurement
         run: |
@@ -112,7 +122,7 @@ jobs:
             exit 1
           fi
           CMDLINE="$(build_sealed_cmdline "$LUKS_UUID")"
-          DIGEST=$(./snp-tools/target/release/snp-digest \
+          DIGEST=$("$SNP_DIGEST" \
             --ovmf=output/qemu/OVMF.fd \
             --kernel=output/qemu/vmlinuz \
             --initrd=output/qemu/initrd.img \

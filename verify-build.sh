@@ -111,15 +111,21 @@ else
     echo "------------------------------------------------------------"
     echo "  LUKS_UUID:        $LUKS_UUID"
 
-    # Locate snp-digest.
+    # Locate snp-digest. Check PATH first, then any of cargo's possible output
+    # paths under snp-tools/target/ (snp-tools/.cargo/config.toml may pin a
+    # specific target triple, so the binary may live under a target-specific
+    # subdirectory rather than directly under target/release/).
+    SNP_DIGEST=""
     if command -v snp-digest >/dev/null 2>&1; then
         SNP_DIGEST="$(command -v snp-digest)"
-    elif [[ -x "${SCRIPT_DIR}/snp-tools/target/release/snp-digest" ]]; then
-        SNP_DIGEST="${SCRIPT_DIR}/snp-tools/target/release/snp-digest"
     else
+        SNP_DIGEST="$(find "${SCRIPT_DIR}/snp-tools/target" \
+            -type f -name snp-digest -perm -u+x 2>/dev/null | head -n1)"
+    fi
+    if [[ -z "$SNP_DIGEST" ]]; then
         echo "ERROR: snp-digest not found." >&2
-        echo "  Build with: cargo build -p snp-tools --release" >&2
-        echo "  Then re-run this script (it expects snp-tools/target/release/snp-digest)." >&2
+        echo "  Build with: (cd snp-tools && cargo build --release)" >&2
+        echo "  Then re-run this script." >&2
         exit 1
     fi
 
