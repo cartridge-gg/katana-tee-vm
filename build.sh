@@ -27,19 +27,35 @@ export LVM2_VERSION LVM2_SHA256
 export E2FSPROGS_VERSION E2FSPROGS_SHA256
 export GLIBC_RUNTIME_PACKAGES GLIBC_RUNTIME_PACKAGE_SHA256S
 
-# Set SOURCE_DATE_EPOCH if not already set (for reproducible builds)
-export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(date +%s)}"
+# SOURCE_DATE_EPOCH controls timestamps embedded in OVMF and the initrd cpio
+# archive — directly affects launch-measurement reproducibility. If unset, fall
+# back to the current wall clock and surface a loud warning so the caller knows
+# the resulting measurement is tied to "when this happened to run".
+if [[ -z "${SOURCE_DATE_EPOCH:-}" ]]; then
+    export SOURCE_DATE_EPOCH="$(date +%s)"
+    # GNU date uses `-d @SECS`, BSD/macOS uses `-r SECS`. Try both.
+    SOURCE_DATE_EPOCH_HUMAN=$(date -u -d "@${SOURCE_DATE_EPOCH}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+                           || date -u -r "${SOURCE_DATE_EPOCH}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+                           || echo "unknown")
+    cat >&2 <<EOF
 
-# Reproducibility validation
-echo ""
+WARNING: SOURCE_DATE_EPOCH was not set.
+         Falling back to the current wall clock:
+             SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}  (${SOURCE_DATE_EPOCH_HUMAN})
+         The build will embed this timestamp in OVMF and the initrd, so the
+         resulting launch measurement will differ from any other build of the
+         same source. For a reproducible build, set it explicitly — typically
+         from the commit time of the tree you're building:
+             export SOURCE_DATE_EPOCH=\$(git log -1 --format=%ct)
+
+EOF
+else
+    export SOURCE_DATE_EPOCH
+fi
+
 if [[ -z "${OVMF_COMMIT:-}" ]]; then
-    echo "WARNING: OVMF_COMMIT not set - OVMF build may not be reproducible"
+    echo "WARNING: OVMF_COMMIT not set - OVMF build may not be reproducible" >&2
 fi
-if [[ -z "${SOURCE_DATE_EPOCH:-}" ]] || [[ "$SOURCE_DATE_EPOCH" == "$(date +%s)" ]]; then
-    echo "NOTE: SOURCE_DATE_EPOCH defaulting to current time"
-    echo "      For reproducible builds: export SOURCE_DATE_EPOCH=\$(git log -1 --format=%ct)"
-fi
-echo ""
 
 function usage()
 {
