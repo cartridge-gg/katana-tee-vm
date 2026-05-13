@@ -1,0 +1,86 @@
+name: Release VM Image
+
+# Builds the Katana TEE VM image (OVMF + kernel + initrd) and snp-tools,
+# and attaches the artifacts to a GitHub Release when a tag is pushed.
+#
+# Runner requirement: SEV-SNP component builds (OVMF, initrd) target an
+# AMD EPYC host with the SEV-SNP-capable toolchain. Configure a self-hosted
+# runner with the labels below, or change `runs-on` to suit your setup.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      katana_version:
+        description: 'Katana release tag to bundle (e.g. v1.0.0, or "latest")'
+        required: true
+        default: 'latest'
+
+jobs:
+  build:
+    runs-on: [self-hosted, linux, x64, sev-snp]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve katana version
+        id: katana
+        run: |
+          version="${{ github.event.inputs.katana_version }}"
+          [ -z "$version" ] && version="latest"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Download katana linux binary
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p .katana-dl
+          # TODO: confirm the exact asset name pattern dojoengine/katana publishes.
+          gh release download "${{ steps.katana.outputs.version }}" \
+            --repo dojoengine/katana \
+            --pattern '*linux*x86_64*.tar.gz' \
+            --dir .katana-dl/
+          tar -xzf .katana-dl/*.tar.gz -C .katana-dl/
+          # Locate the katana binary inside the extracted tree.
+          KATANA_BIN="$(find .katana-dl -type f -name katana -perm -u+x | head -n1)"
+          if [ -z "$KATANA_BIN" ]; then
+            echo "katana binary not found in downloaded asset" >&2
+            exit 1
+          fi
+          echo "KATANA_BIN=$KATANA_BIN" >> "$GITHUB_ENV"
+
+      - name: Build VM image
+        run: ./build.sh --katana "$KATANA_BIN"
+
+      - name: Build snp-tools
+        working-directory: snp-tools
+        run: cargo build --release
+
+      - name: Stage release artifacts
+        run: |
+          mkdir -p release
+          tag="${GITHUB_REF_NAME:-dev}"
+          tar -czf "release/katana-tee-vm-${tag}.tar.gz" -C output/qemu .
+          cp output/qemu/build-info.txt "release/build-info-${tag}.txt"
+          cp snp-tools/target/release/snp-digest release/
+          cp snp-tools/target/release/snp-report release/
+          cp snp-tools/target/release/ovmf-metadata release/
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: katana-tee-vm
+          path: release/
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/katana-tee-vm-*.tar.gz
+            release/build-info-*.txt
+            release/snp-digest
+            release/snp-report
+            release/ovmf-metadata

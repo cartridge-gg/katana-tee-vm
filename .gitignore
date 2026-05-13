@@ -1,0 +1,10 @@
+# Build outputs
+output/
+snp-tools/target/
+
+# Commit-hash markers written by build-ovmf.sh etc.
+source-commit.*
+
+# Editor / OS
+.DS_Store
+*.swp
