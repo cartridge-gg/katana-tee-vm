@@ -175,6 +175,10 @@ jobs:
           KATANA_SHA="$(info_get KATANA_BINARY_SHA256)"
           LUKS_UUID="$(info_get LUKS_UUID)"
           LAUNCH_MEASUREMENT="$(info_get LAUNCH_MEASUREMENT)"
+          OVMF_GIT_URL="$(info_get OVMF_GIT_URL)"
+          OVMF_BRANCH="$(info_get OVMF_BRANCH)"
+          OVMF_COMMIT="$(info_get OVMF_COMMIT)"
+          KERNEL_VERSION="$(info_get KERNEL_VERSION)"
           {
             echo "# Katana TEE VM ${tag}"
             echo
@@ -200,6 +204,14 @@ jobs:
             echo "| \`vmlinuz\` (kernel)              | \`${KERNEL_SHA}\` |"
             echo "| \`initrd.img\`                    | \`${INITRD_SHA}\` |"
             echo "| \`katana\`                        | \`${KATANA_SHA}\` |"
+            echo
+            echo "## Pinned upstream sources"
+            echo
+            echo "| Component | Source | Pin |"
+            echo "|---|---|---|"
+            echo "| OVMF (guest BIOS) | [\`${OVMF_GIT_URL}\`](${OVMF_GIT_URL%.git}/tree/${OVMF_COMMIT}) (branch \`${OVMF_BRANCH}\`) | \`${OVMF_COMMIT}\` |"
+            echo "| Linux kernel      | Ubuntu \`linux-image-unsigned-${KERNEL_VERSION}-generic\` .deb | sha256 \`$(info_get KERNEL_PKG_SHA256)\` |"
+            echo "| Katana            | [\`dojoengine/katana\`](https://github.com/dojoengine/katana/releases/tag/${katana_ver}) | \`${katana_ver}\` |"
             echo
             echo "## Verify before booting"
             echo

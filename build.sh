@@ -337,7 +337,10 @@ fi
 if [ $BUILD_OVMF -eq 1 ]; then
 	INFO_OVMF_GIT_URL="$OVMF_GIT_URL"
 	INFO_OVMF_BRANCH="$OVMF_BRANCH"
-	[ -f "${SCRIPT_DIR}/source-commit.ovmf" ] && INFO_OVMF_COMMIT="$(cat "${SCRIPT_DIR}/source-commit.ovmf")"
+	# OVMF_COMMIT is pinned in build-config; that's the authoritative value
+	# build-ovmf.sh checked out. Source it directly rather than re-reading a
+	# truncated short hash from a side-channel file.
+	INFO_OVMF_COMMIT="$OVMF_COMMIT"
 	[ -f "$INSTALL_DIR/OVMF.fd" ] && INFO_OVMF_SHA256="$(sha256sum "$INSTALL_DIR/OVMF.fd" | awk '{print $1}')"
 fi
 

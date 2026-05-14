@@ -131,8 +131,7 @@ pushd "$OVMF_DIR" >/dev/null
     mkdir -p "$DEST"
     run_cmd cp -f Build/AmdSev/DEBUG_$GCCVERS/FV/OVMF.fd $DEST
 
-    COMMIT=$(git log --format="%h" -1 HEAD)
-    echo "$COMMIT" > "${SCRIPT_DIR}/source-commit.ovmf"
+    COMMIT=$(git log --format="%H" -1 HEAD)
 popd >/dev/null
 
 echo ""
