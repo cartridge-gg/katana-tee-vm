@@ -1,9 +1,10 @@
 #!/bin/bash
 # Start TEE VM with AMD SEV-SNP
-# Usage: ./start-vm.sh [BOOT_COMPONENTS_DIR] [--katana-args CSV] [--no-start]
+# Usage: ./start-vm.sh [BOOT_COMPONENTS_DIR] [--katana-args CSV] [--chain-dir DIR] [--no-start]
 #
 # This script:
-# 1. Starts QEMU with the TEE boot components
+# 1. Starts QEMU with the TEE boot components, passing Katana's launch
+#    configuration (CLI args + optional chain config dir) via fw_cfg
 # 2. Creates and attaches a data disk as /dev/sda
 # 3. Optionally starts Katana asynchronously via a virtio-serial control channel
 # 4. Forwards RPC port to host
@@ -34,8 +35,11 @@
 #   CBITPOS           - 51 (C-bit position for memory encryption)
 #   REDUCED_PHYS_BITS - 1
 #
-# Katana launch arguments are sent after boot over a control channel and are NOT
-# part of the measured kernel command line.
+# Katana launch configuration (CLI args + chain config dir) is delivered via
+# QEMU fw_cfg entries under opt/org.katana/ and is NOT part of the launch
+# measurement — fw_cfg blobs are read by the guest at runtime, not hashed
+# into the launch digest. The guest treats them as untrusted operator input
+# and strips flags it owns (--db-*, --data-dir, --chain) before use.
 #
 # To compute expected measurement, use snp-digest from snp-tools:
 #   cargo build -p snp-tools
@@ -47,7 +51,7 @@
 set -euo pipefail
 
 usage() {
-    echo "Usage: $0 [BOOT_COMPONENTS_DIR] [--katana-args CSV] [--no-start]"
+    echo "Usage: $0 [BOOT_COMPONENTS_DIR] [--katana-args CSV] [--chain-dir DIR] [--no-start]"
     echo "          [--data-disk PATH] [--luks-uuid UUID] [--unsealed]"
     echo ""
     echo "Starts a SEV-SNP VM and launches Katana asynchronously via control channel."
@@ -58,7 +62,13 @@ usage() {
     echo "  BOOT_COMPONENTS_DIR   Optional path containing OVMF.fd, vmlinuz, initrd.img"
     echo ""
     echo "Options:"
-    echo "  --katana-args CSV     Comma-separated Katana CLI args sent after boot"
+    echo "  --katana-args CSV     Comma-separated Katana CLI args, delivered to the"
+    echo "                        guest via QEMU fw_cfg (opt/org.katana/args). NOT part"
+    echo "                        of the launch measurement."
+    echo "  --chain-dir DIR       Directory with chain config files, delivered via"
+    echo "                        fw_cfg (opt/org.katana/chain/<file>) and passed to"
+    echo "                        Katana as --chain inside the guest. NOT part of the"
+    echo "                        launch measurement."
     echo "  --no-start            Boot VM without sending Katana start command"
     echo "  --data-disk PATH      Persistent data disk file attached as /dev/sda"
     echo "                        (default: ~/.katana/data.img, auto-created if absent)"
@@ -80,6 +90,7 @@ usage() {
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BOOT_DIR="${SCRIPT_DIR}/output/qemu"
 KATANA_ARGS_CSV="--http.addr,0.0.0.0,--http.port,5050,--tee,sev-snp"
+CHAIN_DIR=""
 AUTO_START_KATANA=1
 DATA_DISK="${KATANA_DATA_DISK:-}"
 DATA_DISK_DEFAULT="${HOME}/.katana/data.img"
@@ -95,6 +106,15 @@ while [[ $# -gt 0 ]]; do
                 exit 1
             }
             KATANA_ARGS_CSV="$2"
+            shift 2
+            ;;
+
+        --chain-dir)
+            [[ $# -ge 2 ]] || {
+                echo "Error: --chain-dir requires a value"
+                exit 1
+            }
+            CHAIN_DIR="$2"
             shift 2
             ;;
 
@@ -230,6 +250,44 @@ DISK_SIZE_MB=1024
 # Logs
 SERIAL_LOG="$(mktemp /tmp/katana-tee-vm-serial.XXXXXX.log)"
 
+# ------------------------------------------------------------------------------
+# Katana launch configuration via fw_cfg
+# ------------------------------------------------------------------------------
+# Delivered to the guest as QEMU fw_cfg entries (NOT part of the launch
+# measurement — see the header comment):
+#   opt/org.katana/args           CLI args, one per line
+#   opt/org.katana/chain/<file>   chain config dir contents; the guest
+#                                 materializes them and passes --chain
+KATANA_ARGS_FILE="$(mktemp /tmp/katana-tee-vm-args.XXXXXX)"
+printf '%s' "$KATANA_ARGS_CSV" | tr ',' '\n' > "$KATANA_ARGS_FILE"
+FW_CFG_OPTS=(-fw_cfg "name=opt/org.katana/args,file=$KATANA_ARGS_FILE")
+
+if [[ -n "$CHAIN_DIR" ]]; then
+    if [[ ! -d "$CHAIN_DIR" ]]; then
+        echo "Error: --chain-dir is not a directory: $CHAIN_DIR"
+        exit 1
+    fi
+    CHAIN_FILE_COUNT=0
+    for chain_file in "$CHAIN_DIR"/*; do
+        [[ -f "$chain_file" ]] || continue
+        chain_base="$(basename "$chain_file")"
+        # fw_cfg entry names are capped at 55 chars and the
+        # "opt/org.katana/chain/" prefix uses 21 of them; commas and '='
+        # would also break QEMU's -fw_cfg option parsing.
+        if [[ ! "$chain_base" =~ ^[A-Za-z0-9._-]+$ ]] || [[ "${#chain_base}" -gt 34 ]]; then
+            echo "Error: chain config filename not representable as a fw_cfg entry: $chain_base"
+            echo "  (allowed: [A-Za-z0-9._-], max 34 chars)"
+            exit 1
+        fi
+        FW_CFG_OPTS+=(-fw_cfg "name=opt/org.katana/chain/${chain_base},file=$chain_file")
+        CHAIN_FILE_COUNT=$((CHAIN_FILE_COUNT + 1))
+    done
+    if [[ "$CHAIN_FILE_COUNT" -eq 0 ]]; then
+        echo "Error: --chain-dir contains no regular files: $CHAIN_DIR"
+        exit 1
+    fi
+fi
+
 show_serial_tail() {
     echo ""
     echo "=== Serial output (last 80 lines) ==="
@@ -277,6 +335,7 @@ cleanup() {
     fi
 
     [[ -f "$SERIAL_LOG" ]] && rm -f "$SERIAL_LOG"
+    [[ -n "${KATANA_ARGS_FILE:-}" && -f "$KATANA_ARGS_FILE" ]] && rm -f "$KATANA_ARGS_FILE"
     [[ -S "$CONTROL_SOCKET" ]] && rm -f "$CONTROL_SOCKET"
     # NOTE: $DISK_IMAGE is persistent — not cleaned up.
 
@@ -367,6 +426,8 @@ echo "  vCPUs:          $VCPU_COUNT"
 echo "  Memory:         $MEMORY"
 echo "  Serial:         $SERIAL_LOG"
 echo "  Control socket: $CONTROL_SOCKET"
+echo "  Katana args:    $KATANA_ARGS_CSV (via fw_cfg, unmeasured)"
+echo "  Chain dir:      ${CHAIN_DIR:-<none>}"
 echo "  RPC:            localhost:$HOST_RPC_PORT -> VM:$KATANA_RPC_PORT"
 echo ""
 echo "To compute expected launch measurement:"
@@ -391,6 +452,7 @@ qemu-system-x86_64 \
     -device virtio-serial-pci,id=virtio-serial0 \
     -chardev socket,id=katanactl,path="$CONTROL_SOCKET",server=on,wait=off \
     -device virtserialport,chardev=katanactl,name="$CONTROL_PORT_NAME" \
+    "${FW_CFG_OPTS[@]}" \
     -device virtio-scsi-pci,id=scsi0 \
     -drive file="$DISK_IMAGE",format=raw,if=none,id=disk0,cache=none \
     -device scsi-hd,drive=disk0,bus=scsi0.0 \
@@ -466,7 +528,8 @@ if [[ "$AUTO_START_KATANA" -eq 1 ]]; then
 
     echo ""
     echo "Sending async Katana start command..."
-    START_RESPONSE="$(send_control_command "start $KATANA_ARGS_CSV" || true)"
+    # Bare `start` — launch config was already delivered via fw_cfg.
+    START_RESPONSE="$(send_control_command "start" || true)"
     if [[ -z "$START_RESPONSE" ]]; then
         echo "Error: No response from guest control channel"
         show_serial_tail
@@ -512,8 +575,9 @@ if [[ "$AUTO_START_KATANA" -eq 1 ]]; then
 else
     echo ""
     echo "Katana auto-start disabled (--no-start)."
-    echo "Use the control socket to send commands manually:"
-    echo "  printf 'start $KATANA_ARGS_CSV\n' | socat - UNIX-CONNECT:$CONTROL_SOCKET"
+    echo "Use the control socket to send commands manually (launch config was"
+    echo "already delivered via fw_cfg; start takes no arguments):"
+    echo "  printf 'start\n' | socat - UNIX-CONNECT:$CONTROL_SOCKET"
     echo "  printf 'status\n' | socat - UNIX-CONNECT:$CONTROL_SOCKET"
 fi
 
