@@ -87,6 +87,27 @@ jobs:
         # needed for direct kernel boot below).
         run: ./build.sh --katana "$KATANA_BIN" kernel initrd
 
+      - name: Reproducibility check — rebuild initrd, compare digests
+        # Byte-identical initrds are the repo's core promise: the SEV-SNP
+        # launch measurement hashes the initrd, so verifiers can only
+        # reproduce a published measurement if the build is deterministic.
+        # Same SOURCE_DATE_EPOCH, same pins, fresh output dir — any digest
+        # drift here means nondeterminism crept into the packaging (unsorted
+        # globs, leaked timestamps, host paths). The second build reuses the
+        # already-built static cryptsetup/snp-derivekey, so it only repeats
+        # the deb downloads and cpio packaging.
+        run: |
+          first="$(sha256sum output/qemu/initrd.img | awk '{print $1}')"
+          ./build.sh --katana "$KATANA_BIN" --install output/repro initrd
+          second="$(sha256sum output/repro/initrd.img | awk '{print $1}')"
+          echo "first build:  $first"
+          echo "second build: $second"
+          if [ "$first" != "$second" ]; then
+            echo "::error::initrd build is NOT reproducible — digests differ across identical builds"
+            exit 1
+          fi
+          echo "Reproducible: digests match"
+
       - name: Boot smoke test
         # --output-dir is required: the script's default resolves relative to
         # scripts/, not the repo root where build.sh writes its artifacts.
@@ -102,4 +123,5 @@ jobs:
           path: |
             output/qemu/initrd.img
             output/qemu/build-info.txt
+            output/repro/initrd.img
           if-no-files-found: ignore
