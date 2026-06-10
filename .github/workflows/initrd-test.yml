@@ -65,12 +65,14 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p .katana-dl
-          # Portable build only — the anchored `_linux_amd64.tar.gz` suffix
-          # cannot match the `_native` variant (same pattern as release.yml).
-          # No tag argument: gh downloads from the latest release.
+          # katana product + portable build only (same pattern as release.yml):
+          # the `katana_` prefix excludes the paymaster-service_* / vrf-server_*
+          # tarballs that newer releases ship alongside it, and the anchored
+          # suffix excludes the `_native` variant. No tag argument: gh
+          # downloads from the latest release.
           gh release download \
             --repo dojoengine/katana \
-            --pattern '*_linux_amd64.tar.gz' \
+            --pattern 'katana_*_linux_amd64.tar.gz' \
             --dir .katana-dl/
           tar -xzf .katana-dl/*.tar.gz -C .katana-dl/
           KATANA_BIN="$(find .katana-dl -type f -name katana -perm -u+x | head -n1)"
