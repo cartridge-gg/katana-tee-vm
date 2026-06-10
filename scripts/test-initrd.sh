@@ -4,8 +4,9 @@
 # ==============================================================================
 #
 # Runs a focused initrd boot smoke test without requiring the full SEV-SNP
-# launch path. Uses plain QEMU (no OVMF/SEV), starts Katana through the
-# async control channel, and validates RPC readiness.
+# launch path. Uses plain QEMU (no OVMF/SEV), delivers Katana's CLI args via
+# fw_cfg (opt/org.katana/args, same mechanism as start-vm.sh), starts Katana
+# through the async control channel, and validates RPC readiness.
 #
 # Usage:
 #   ./test-initrd.sh [OPTIONS]
@@ -37,6 +38,7 @@ TEMP_DIR="$(mktemp -d /tmp/katana-amdsev-initrd-test.XXXXXX)"
 SERIAL_LOG="${TEMP_DIR}/serial.log"
 DISK_IMG="${TEMP_DIR}/test-disk.img"
 CONTROL_SOCKET="${TEMP_DIR}/katana-control.sock"
+KATANA_ARGS_FILE="${TEMP_DIR}/katana-args.txt"
 QEMU_PID=""
 
 usage() {
@@ -119,7 +121,8 @@ wait_for_control_channel() {
 }
 
 start_katana_via_control_channel() {
-    local start_cmd="start --http.addr,0.0.0.0,--http.port,${VM_RPC_PORT},--tee,sev-snp"
+    # Bare `start` — CLI args were delivered via fw_cfg at QEMU launch.
+    local start_cmd="start"
     local response=""
 
     for ((elapsed = 1; elapsed <= BOOT_TIMEOUT; elapsed++)); do
@@ -241,6 +244,14 @@ run_boot_smoke_test() {
     truncate -s "$TEST_DISK_SIZE" "$DISK_IMG"
     mkfs.ext4 -q -F "$DISK_IMG"
 
+    # Katana CLI args, one per line, delivered via fw_cfg (unmeasured —
+    # same path as start-vm.sh).
+    printf '%s\n' \
+        "--http.addr" "0.0.0.0" \
+        "--http.port" "${VM_RPC_PORT}" \
+        "--tee" "sev-snp" \
+        > "$KATANA_ARGS_FILE"
+
     KVM_OPTS=()
     if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
         KVM_OPTS=(-enable-kvm -cpu host)
@@ -262,6 +273,7 @@ run_boot_smoke_test() {
         -device virtio-serial-pci,id=virtio-serial0 \
         -chardev "socket,id=katanactl,path=${CONTROL_SOCKET},server=on,wait=off" \
         -device virtserialport,chardev=katanactl,name=org.katana.control.0 \
+        -fw_cfg "name=opt/org.katana/args,file=${KATANA_ARGS_FILE}" \
         -device virtio-scsi-pci,id=scsi0 \
         -drive "file=${DISK_IMG},format=raw,if=none,id=disk0,cache=none" \
         -device scsi-hd,drive=disk0,bus=scsi0.0 \

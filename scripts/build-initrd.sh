@@ -13,6 +13,8 @@
 #                             kernel — see modules.builtin — so we don't ship it.)
 #   - glibc runtime packages: Provides dynamic linker and shared libraries
 #   - linux-modules-extra:    Contains SEV-SNP kernel modules (tsm.ko, sev-guest.ko)
+#                             and qemu_fw_cfg.ko (host-supplied launch config via
+#                             QEMU fw_cfg — see load_fw_cfg_config in the init)
 #
 # Sealed-storage builds also consume two pre-built static binaries —
 # `cryptsetup` and `mkfs.ext2` — supplied via the CRYPTSETUP_BINARY and
@@ -41,9 +43,9 @@ set -euo pipefail
 umask 022
 
 REQUIRED_APPLETS=(sh mount umount sleep kill cat mkdir ln mknod ip insmod poweroff sync \
-                   tr grep rm mkfifo)
+                   tr grep rm mkfifo cp)
 SYMLINK_APPLETS=(sh mount umount mkdir mknod switch_root ip insmod sleep kill cat ln poweroff sync \
-                  tr grep rm mkfifo)
+                  tr grep rm mkfifo cp)
 OPTIONAL_RUNTIME_LIBS=(libnss_dns.so.2 libnss_files.so.2 libresolv.so.2)
 # `mkfs.ext2` is not a busybox-static applet on Ubuntu, so a static binary
 # (built by build-cryptsetup.sh from e2fsprogs source) is supplied via
@@ -536,6 +538,20 @@ else
 fi
 
 # ------------------------------------------------------------------------------
+# Install QEMU fw_cfg Kernel Module
+# ------------------------------------------------------------------------------
+# qemu_fw_cfg.ko exposes QEMU's fw_cfg device at /sys/firmware/qemu_fw_cfg.
+# The host delivers Katana's launch configuration (CLI args + chain config
+# dir) through fw_cfg entries under opt/org.katana/ — deliberately OUTSIDE
+# the SEV-SNP launch measurement, unlike the kernel cmdline. Safe under SNP:
+# the driver's read path (fw_cfg_read_blob) is pure port I/O (ioread8_rep,
+# no DMA), which the #VC handler supports. Ships in linux-modules-extra,
+# which both sealed and unsealed builds download.
+log_info "Installing qemu_fw_cfg kernel module"
+FIRMWARE_MODULES_DIR="$EXTRACTED_DIR/lib/modules/$KERNEL_VERSION-generic/kernel/drivers/firmware"
+install_sev_module "qemu_fw_cfg.ko" "$FIRMWARE_MODULES_DIR/qemu_fw_cfg.ko" "lib/modules/qemu_fw_cfg.ko"
+
+# ------------------------------------------------------------------------------
 # Install Device-Mapper + dm-integrity transitive deps (sealed-storage only)
 # ------------------------------------------------------------------------------
 # Each module ships in `linux-modules-$KVER-generic` from Ubuntu noble. The
@@ -843,7 +859,7 @@ set -eu
 export PATH=/bin
 export LD_LIBRARY_PATH=/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:/lib:/usr/lib
 
-# log writes to stderr so command substitution like `$(strip_db_args ...)`
+# log writes to stderr so command substitution like `$(strip_reserved_args ...)`
 # captures only the function's real output. Both stdout and stderr are
 # redirected to /dev/console below, so operator UX is unchanged.
 log() { echo "[init] $*" >&2; }
@@ -854,6 +870,24 @@ SHUTTING_DOWN=0
 KATANA_EXIT_CODE="never"
 CONTROL_PORT_NAME="org.katana.control.0"
 CONTROL_PORT_LINK="/dev/virtio-ports/org.katana.control.0"
+
+# Host-supplied launch configuration, delivered via QEMU fw_cfg (-fw_cfg in
+# start-vm.sh) and read once at boot by load_fw_cfg_config:
+#
+#   opt/org.katana/args             whitespace-separated Katana CLI args
+#   opt/org.katana/chain/<file>     chain config dir contents; materialized
+#                                   at $KATANA_CHAIN_DIR and passed to
+#                                   Katana via --chain
+#
+# fw_cfg entries are deliberately NOT part of the SEV-SNP launch measurement
+# (only OVMF and the kernel/initrd/cmdline hashes are). They are therefore
+# operator-controlled input and sanitized with strip_reserved_args before use.
+FW_CFG_BY_NAME="/sys/firmware/qemu_fw_cfg/by_name"
+FW_CFG_ARGS_RAW="${FW_CFG_BY_NAME}/opt/org.katana/args/raw"
+FW_CFG_CHAIN_BASE="${FW_CFG_BY_NAME}/opt/org.katana/chain"
+KATANA_CHAIN_DIR="/run/katana-chain"
+KATANA_FWCFG_ARGS=""
+KATANA_CHAIN_PRESENT=0
 
 # Sealed-storage state (populated from /proc/cmdline; see parse_cmdline_vars).
 # SEALED_MODE=1 means an encrypted /dev/sda backs /mnt/data and the derived key
@@ -988,10 +1022,11 @@ load_dm_modules() {
     done
 }
 
-# Drop any --data-dir / --db-dir / --db-* flags from a space-separated arg
-# string. This prevents an operator with access to the virtio-serial control
-# channel from pointing Katana at a data directory outside the sealed mount,
-# escaping the sealing guarantee. Runs inside the measured initrd, so the
+# Drop flags that init owns from a space-separated arg string: --data-dir /
+# --db-dir / --db-* (database location) and --chain (chain config dir). This
+# prevents host-supplied launch config (fw_cfg) from pointing Katana at a
+# data directory outside the sealed mount or at a chain spec other than the
+# one init materialized from fw_cfg. Runs inside the measured initrd, so the
 # defense itself is pinned.
 #
 # `--data-dir` is the canonical katana flag; `--db-dir` is its alias (see
@@ -1005,22 +1040,23 @@ load_dm_modules() {
 #           `--db-dir value`       (alias, two tokens)
 #           `--db-dir=value`       (alias, one token)
 #           `--db-anything[=val]`  (catch-all for future --db-* flags)
-strip_db_args() {
+#           `--chain value`        (two tokens) / `--chain=value` (one token)
+strip_reserved_args() {
     SKIP_NEXT=0
     OUT=""
     for tok in $*; do
         if [ "$SKIP_NEXT" -eq 1 ]; then
             SKIP_NEXT=0
-            log "strip_db_args: dropped value token '$tok'"
+            log "strip_reserved_args: dropped value token '$tok'"
             continue
         fi
         case "$tok" in
-            --data-dir=*|--db-*=*)
-                log "strip_db_args: dropped '$tok'"
+            --data-dir=*|--db-*=*|--chain=*)
+                log "strip_reserved_args: dropped '$tok'"
                 continue
                 ;;
-            --data-dir|--db-*)
-                log "strip_db_args: dropped '$tok' (and next token)"
+            --data-dir|--db-*|--chain)
+                log "strip_reserved_args: dropped '$tok' (and next token)"
                 SKIP_NEXT=1
                 continue
                 ;;
@@ -1028,6 +1064,51 @@ strip_db_args() {
         OUT="${OUT}${OUT:+ }${tok}"
     done
     echo "$OUT"
+}
+
+# Read host-supplied launch configuration from QEMU fw_cfg. Loads the
+# qemu_fw_cfg module, reads the CLI args entry, and materializes the chain
+# config entries into $KATANA_CHAIN_DIR (rootfs ramfs — ephemeral, never the
+# sealed mount, so host-controlled files don't persist across boots).
+#
+# Missing module / device / entries are all non-fatal: the VM boots and
+# Katana starts with only the flags init bakes in (--db-dir, --chain).
+load_fw_cfg_config() {
+    if [ ! -d "$FW_CFG_BY_NAME" ]; then
+        if [ ! -f /lib/modules/qemu_fw_cfg.ko ]; then
+            log "WARNING: qemu_fw_cfg.ko not in initrd; no fw_cfg launch config"
+            return 0
+        fi
+        if ! /bin/insmod /lib/modules/qemu_fw_cfg.ko; then
+            log "WARNING: insmod qemu_fw_cfg.ko failed; no fw_cfg launch config"
+            return 0
+        fi
+    fi
+    if [ ! -d "$FW_CFG_BY_NAME" ]; then
+        log "WARNING: $FW_CFG_BY_NAME missing after module load; no fw_cfg launch config"
+        return 0
+    fi
+
+    if [ -f "$FW_CFG_ARGS_RAW" ]; then
+        RAW_FWCFG_ARGS="$(tr '\n\r\t' '   ' < "$FW_CFG_ARGS_RAW")"
+        KATANA_FWCFG_ARGS="$(strip_reserved_args $RAW_FWCFG_ARGS)"
+        log "fw_cfg katana args: ${KATANA_FWCFG_ARGS:-<empty>}"
+    else
+        log "No fw_cfg args entry (opt/org.katana/args)"
+    fi
+
+    for raw in "$FW_CFG_CHAIN_BASE"/*/raw; do
+        [ -f "$raw" ] || continue
+        ENTRY_DIR="${raw%/raw}"
+        CHAIN_FILE_NAME="${ENTRY_DIR##*/}"
+        mkdir -p "$KATANA_CHAIN_DIR"
+        cp "$raw" "$KATANA_CHAIN_DIR/$CHAIN_FILE_NAME"
+        KATANA_CHAIN_PRESENT=1
+        log "fw_cfg chain file: $CHAIN_FILE_NAME"
+    done
+    if [ "$KATANA_CHAIN_PRESENT" -eq 0 ]; then
+        log "No fw_cfg chain config entries (opt/org.katana/chain/*)"
+    fi
 }
 
 # Sealed-storage unlock. Called only when SEALED_MODE=1.
@@ -1210,14 +1291,18 @@ handle_control_command() {
                 return 0
             fi
 
-            KATANA_ARGS=""
+            # Launch configuration comes exclusively from fw_cfg, read once
+            # at boot by load_fw_cfg_config. A payload here means a stale
+            # client speaking the old `start <csv-args>` protocol — reject
+            # loudly rather than silently ignoring its args.
             if [ -n "$CMD_PAYLOAD" ]; then
-                RAW_ARGS="$(echo "$CMD_PAYLOAD" | tr ',' ' ')"
-                # Defense in depth: a later clap flag on the command line
-                # would override the --db-dir we bake in below, letting an
-                # operator point Katana at a directory outside the sealed
-                # mount. Strip any --db-* from attacker-influenced input.
-                KATANA_ARGS="$(strip_db_args $RAW_ARGS)"
+                respond_control "err start-takes-no-args (launch config comes from fw_cfg)"
+                return 0
+            fi
+
+            CHAIN_ARGS=""
+            if [ "$KATANA_CHAIN_PRESENT" -eq 1 ]; then
+                CHAIN_ARGS="--chain $KATANA_CHAIN_DIR"
             fi
 
             log "Starting katana asynchronously..."
@@ -1228,7 +1313,7 @@ handle_control_command() {
             # EBUSY — and a failed `exec` redirect under POSIX `set -e`
             # terminates init, panicking the kernel.
             # shellcheck disable=SC2086
-            /bin/katana --db-dir="$KATANA_DB_DIR" $KATANA_ARGS 3<&- 3>&- &
+            /bin/katana --db-dir="$KATANA_DB_DIR" $CHAIN_ARGS $KATANA_FWCFG_ARGS 3<&- 3>&- &
             KATANA_PID=$!
             KATANA_EXIT_CODE="running"
             respond_control "ok started pid=$KATANA_PID"
@@ -1309,6 +1394,10 @@ done
 if [ "$TEE_DEVICE_FOUND" -eq 0 ]; then
     log "WARNING: No TEE attestation interface found"
 fi
+
+# Read host-supplied launch config (CLI args + chain config) from fw_cfg.
+log "Loading fw_cfg launch configuration..."
+load_fw_cfg_config
 
 # Configure networking (QEMU user-mode defaults)
 log "Configuring network..."
