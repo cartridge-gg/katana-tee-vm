@@ -1516,6 +1516,14 @@ if [[ "$SEALED_STORAGE_BUILD" -eq 1 ]]; then
     chmod 0755 bin/cryptsetup bin/mkfs.ext2
     [[ -n "$SNP_DERIVEKEY_BINARY" ]] && chmod 0755 bin/snp-derivekey
 fi
+# The ELF interpreter is execve'd by the kernel when launching katana, so it
+# must keep its execute bit through the 0644 sweep above — a non-executable
+# interpreter makes every dynamic exec fail with EACCES ("Permission
+# denied", exit 126). Shared libraries stay 0644: the loader only opens and
+# mmaps them, which needs read permission, not execute.
+if [[ -n "$KATANA_INTERPRETER" ]]; then
+    chmod 0755 "${KATANA_INTERPRETER#/}"
+fi
 chmod 1777 tmp
 
 log_info "Setting timestamps to SOURCE_DATE_EPOCH (${SOURCE_DATE_EPOCH})"
