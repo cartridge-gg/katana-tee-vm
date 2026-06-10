@@ -32,7 +32,8 @@ export GLIBC_RUNTIME_PACKAGES GLIBC_RUNTIME_PACKAGE_SHA256S
 # back to the current wall clock and surface a loud warning so the caller knows
 # the resulting measurement is tied to "when this happened to run".
 if [[ -z "${SOURCE_DATE_EPOCH:-}" ]]; then
-    export SOURCE_DATE_EPOCH="$(date +%s)"
+    SOURCE_DATE_EPOCH="$(date +%s)"
+    export SOURCE_DATE_EPOCH
     # GNU date uses `-d @SECS`, BSD/macOS uses `-r SECS`. Try both.
     SOURCE_DATE_EPOCH_HUMAN=$(date -u -d "@${SOURCE_DATE_EPOCH}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
                            || date -u -r "${SOURCE_DATE_EPOCH}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
@@ -138,7 +139,7 @@ while [ -n "$1" ]; do
 		BUILD_INITRD=1
 		shift
 		;;
-	-*|--*)
+	-*)
 		echo "Unsupported option: [$1]"
 		usage
 		;;
@@ -256,31 +257,34 @@ fi
 mkdir -p $INSTALL_DIR
 IDIR=$INSTALL_DIR
 INSTALL_DIR=$(readlink -e $INSTALL_DIR)
-[ -n "$INSTALL_DIR" -a -d "$INSTALL_DIR" ] || {
+[ -n "$INSTALL_DIR" ] && [ -d "$INSTALL_DIR" ] || {
 	echo "Installation directory [$IDIR] does not exist, exiting"
 	exit 1
 }
 
 if [ $BUILD_OVMF -eq 1 ]; then
 	"${SCRIPT_DIR}/scripts/build-ovmf.sh" "$INSTALL_DIR"
-	if [ $? -ne 0 ]; then
-		echo "OVMF build failed: $?"
+	rc=$?
+	if [ $rc -ne 0 ]; then
+		echo "OVMF build failed: $rc"
 		exit 1
 	fi
 fi
 
 if [ $BUILD_KERNEL -eq 1 ]; then
 	"${SCRIPT_DIR}/scripts/build-kernel.sh" "$INSTALL_DIR"
-	if [ $? -ne 0 ]; then
-		echo "Kernel build failed: $?"
+	rc=$?
+	if [ $rc -ne 0 ]; then
+		echo "Kernel build failed: $rc"
 		exit 1
 	fi
 fi
 
 if [ $BUILD_INITRD -eq 1 ]; then
 	"${SCRIPT_DIR}/scripts/build-initrd.sh" "$KATANA_BINARY" "$INSTALL_DIR/initrd.img"
-	if [ $? -ne 0 ]; then
-		echo "Initrd build failed: $?"
+	rc=$?
+	if [ $rc -ne 0 ]; then
+		echo "Initrd build failed: $rc"
 		exit 1
 	fi
 	# Copy katana binary to output directory
