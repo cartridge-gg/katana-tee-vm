@@ -216,7 +216,7 @@ done
 # binary paths produced by `misc/AMDSEV/build-cryptsetup.sh` and
 # `cargo build -p katana-tee --features snp` respectively. Both source builds
 # are wired up by `misc/AMDSEV/build.sh`; sourcing build-config and running
-# build.sh is the standard invocation (see `.github/workflows/amdsev-initrd-test.yml`).
+# build.sh is the standard invocation (see `.github/workflows/initrd-test.yml`).
 #
 # Opt out by setting `KATANA_UNSEALED_BUILD=1` in the environment. Used by
 # CI on hosts without Docker and for cheap dev-iteration builds. The result
