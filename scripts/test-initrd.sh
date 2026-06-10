@@ -251,11 +251,15 @@ run_boot_smoke_test() {
     mkfs.ext4 -q -F "$DISK_IMG"
 
     # Katana CLI args, one per line, delivered via fw_cfg (unmeasured —
-    # same path as start-vm.sh).
+    # same path as start-vm.sh). Deliberately NO --tee flag: every published
+    # katana release (<= v1.7.1) predates TEE support, so the latest release
+    # binary rejects it with "unexpected argument". The smoke test validates
+    # what this repo owns — initrd packaging, init, fw_cfg delivery, control
+    # channel, storage mount, RPC reachability — not katana's TEE feature.
+    # Re-add "--tee sev-snp" once a TEE-capable katana release exists.
     printf '%s\n' \
         "--http.addr" "0.0.0.0" \
         "--http.port" "${VM_RPC_PORT}" \
-        "--tee" "sev-snp" \
         > "$KATANA_ARGS_FILE"
 
     KVM_OPTS=()
