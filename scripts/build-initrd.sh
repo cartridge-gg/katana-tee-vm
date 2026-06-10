@@ -1044,6 +1044,9 @@ load_dm_modules() {
 strip_reserved_args() {
     SKIP_NEXT=0
     OUT=""
+    # Word-splitting the unquoted $* is the point: callers pass a flat
+    # whitespace-separated arg string, not pre-split words.
+    # shellcheck disable=SC2048
     for tok in $*; do
         if [ "$SKIP_NEXT" -eq 1 ]; then
             SKIP_NEXT=0
