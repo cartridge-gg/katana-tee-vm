@@ -88,7 +88,9 @@ jobs:
         run: ./build.sh --katana "$KATANA_BIN" kernel initrd
 
       - name: Boot smoke test
-        run: ./scripts/test-initrd.sh --timeout 300
+        # --output-dir is required: the script's default resolves relative to
+        # scripts/, not the repo root where build.sh writes its artifacts.
+        run: ./scripts/test-initrd.sh --output-dir output/qemu --timeout 300
 
       - name: Upload initrd for debugging
         # Only on failure — the artifact exists to reproduce a failed boot
