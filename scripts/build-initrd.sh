@@ -218,7 +218,7 @@ done
 # binary paths produced by `misc/AMDSEV/build-cryptsetup.sh` and
 # `cargo build -p katana-tee --features snp` respectively. Both source builds
 # are wired up by `misc/AMDSEV/build.sh`; sourcing build-config and running
-# build.sh is the standard invocation (see `.github/workflows/amdsev-initrd-test.yml`).
+# build.sh is the standard invocation (see `.github/workflows/initrd-test.yml`).
 #
 # Opt out by setting `KATANA_UNSEALED_BUILD=1` in the environment. Used by
 # CI on hosts without Docker and for cheap dev-iteration builds. The result
@@ -1518,6 +1518,14 @@ chmod 0755 bin/busybox bin/katana init
 if [[ "$SEALED_STORAGE_BUILD" -eq 1 ]]; then
     chmod 0755 bin/cryptsetup bin/mkfs.ext2
     [[ -n "$SNP_DERIVEKEY_BINARY" ]] && chmod 0755 bin/snp-derivekey
+fi
+# The ELF interpreter is execve'd by the kernel when launching katana, so it
+# must keep its execute bit through the 0644 sweep above — a non-executable
+# interpreter makes every dynamic exec fail with EACCES ("Permission
+# denied", exit 126). Shared libraries stay 0644: the loader only opens and
+# mmaps them, which needs read permission, not execute.
+if [[ -n "$KATANA_INTERPRETER" ]]; then
+    chmod 0755 "${KATANA_INTERPRETER#/}"
 fi
 chmod 1777 tmp
 

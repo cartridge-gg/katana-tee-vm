@@ -90,7 +90,13 @@ assert_qemu_running() {
 
 send_control_command() {
     local cmd="$1"
-    printf '%s\n' "$cmd" | socat -T 5 - UNIX-CONNECT:"$CONTROL_SOCKET" 2>/dev/null | head -n 1 | tr -d '\r'
+    # Keep stdin open for a window after the command (same workaround as
+    # send_control_command in start-vm.sh): socat closes the write side of
+    # the unix socket as soon as stdin EOFs, QEMU treats that as a full
+    # chardev disconnect, and the guest's reply written to the virtio-serial
+    # port is dropped before it can flow back. The sleep gives the guest's
+    # read -> handle -> respond round-trip time to land.
+    { printf '%s\n' "$cmd"; sleep 2; } | socat -t 2 -T 4 - UNIX-CONNECT:"$CONTROL_SOCKET" 2>/dev/null | head -n 1 | tr -d '\r'
 }
 
 wait_for_control_channel() {
@@ -245,11 +251,15 @@ run_boot_smoke_test() {
     mkfs.ext4 -q -F "$DISK_IMG"
 
     # Katana CLI args, one per line, delivered via fw_cfg (unmeasured —
-    # same path as start-vm.sh).
+    # same path as start-vm.sh). Deliberately NO --tee flag: every published
+    # katana release (<= v1.7.1) predates TEE support, so the latest release
+    # binary rejects it with "unexpected argument". The smoke test validates
+    # what this repo owns — initrd packaging, init, fw_cfg delivery, control
+    # channel, storage mount, RPC reachability — not katana's TEE feature.
+    # Re-add "--tee sev-snp" once a TEE-capable katana release exists.
     printf '%s\n' \
         "--http.addr" "0.0.0.0" \
         "--http.port" "${VM_RPC_PORT}" \
-        "--tee" "sev-snp" \
         > "$KATANA_ARGS_FILE"
 
     KVM_OPTS=()
