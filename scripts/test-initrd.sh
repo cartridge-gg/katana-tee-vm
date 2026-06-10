@@ -6,7 +6,10 @@
 # Runs a focused initrd boot smoke test without requiring the full SEV-SNP
 # launch path. Uses plain QEMU (no OVMF/SEV), delivers Katana's CLI args via
 # fw_cfg (opt/org.katana/args, same mechanism as start-vm.sh), starts Katana
-# through the async control channel, and validates RPC readiness.
+# through the async control channel, and validates RPC readiness. Along the
+# way it asserts the control-channel protocol contract: a `start` with a
+# payload is rejected (config comes from fw_cfg), unknown commands error,
+# a rejected start does not launch Katana, and a duplicate start is refused.
 #
 # Usage:
 #   ./test-initrd.sh [OPTIONS]
@@ -124,6 +127,53 @@ wait_for_control_channel() {
     warn "Timed out waiting for control channel"
     print_serial_output
     die "Boot smoke test timed out"
+}
+
+# Send a control command and require a response with the given prefix.
+# The guest's reply can be dropped if socat tears the socket down before it
+# lands (the same race the start/status polls tolerate by retrying), so an
+# empty reply is retried; a non-empty wrong reply is a deterministic protocol
+# violation and fails immediately.
+expect_control_response() {
+    local cmd="$1"
+    local expected_prefix="$2"
+    local label="$3"
+    local response=""
+
+    for _ in 1 2 3 4 5; do
+        response="$(send_control_command "$cmd" || true)"
+        case "$response" in
+            ${expected_prefix}*)
+                log "  ${label}: ${response}"
+                return 0
+                ;;
+        esac
+        [ -n "$response" ] && break
+        sleep 1
+    done
+
+    warn "Unexpected response to ${label}: '${response:-<none>}' (expected '${expected_prefix} ...')"
+    print_serial_output
+    die "Control protocol check failed: ${label}"
+}
+
+# Protocol assertions that must run while Katana is NOT yet running. The
+# init's start handler checks already-running before it checks for a payload,
+# so the payload rejection is only observable pre-start.
+verify_control_protocol_prestart() {
+    log "Verifying control-channel protocol (pre-start)"
+    # Launch config comes from fw_cfg: the old `start <csv-args>` protocol
+    # must be rejected loudly, not have its args silently dropped...
+    expect_control_response "start --http.port,9999" "err start-takes-no-args" "start with payload"
+    # ...and unknown commands must error rather than being ignored.
+    expect_control_response "bogus-command" "err unknown-command" "unknown command"
+    # The rejected start must not have launched Katana.
+    expect_control_response "status" "stopped" "status after rejected start"
+}
+
+verify_duplicate_start_rejected() {
+    log "Verifying duplicate start is refused"
+    expect_control_response "start" "err already-running" "duplicate start"
 }
 
 start_katana_via_control_channel() {
@@ -295,7 +345,9 @@ run_boot_smoke_test() {
     log "QEMU started with PID $QEMU_PID"
 
     wait_for_control_channel
+    verify_control_protocol_prestart
     start_katana_via_control_channel
+    verify_duplicate_start_rejected
 
     for ((elapsed = 1; elapsed <= BOOT_TIMEOUT; elapsed++)); do
         assert_qemu_running "Boot smoke test failed"
