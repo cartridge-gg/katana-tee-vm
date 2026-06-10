@@ -54,6 +54,7 @@ The `snp-tools` crate provides CLI utilities for SEV-SNP development:
 | `snp-digest` | Calculate SEV-SNP launch measurement digest |
 | `snp-report` | Decode and display SEV-SNP attestation reports |
 | `ovmf-metadata` | Extract and display OVMF SEV metadata sections |
+| `snp-derivekey` | Derive a sealed-storage key via `SNP_GET_DERIVED_KEY` (runs in-guest; used by the initrd to unlock the LUKS data disk) |
 
 Build with:
 ```sh
@@ -72,8 +73,35 @@ cargo build -p snp-tools
 
 ## Running
 
-The QEMU command below boots the VM but does not automatically start Katana.  
-Katana must be started asynchronously via the control channel.
+`start-vm.sh` launches a TEE VM with SEV-SNP enabled and starts Katana inside it:
+
+```sh
+# Start VM with default boot components (output/qemu/)
+sudo ./start-vm.sh
+
+# Or specify a custom boot components directory
+sudo ./start-vm.sh /path/to/boot-components
+
+# Or customize Katana runtime flags (comma-separated)
+sudo ./start-vm.sh --katana-args "--http.addr,0.0.0.0,--http.port,5050,--tee,sev-snp,--dev"
+
+# Or boot without starting Katana (drive the control channel manually)
+sudo ./start-vm.sh --no-start
+```
+
+The script:
+- Starts QEMU with SEV-SNP confidential computing enabled
+- Uses direct kernel boot with `kernel-hashes=on` for attestation
+- Creates (on first run) and attaches a persistent data disk as `/dev/sda` — default `~/.katana/data.img`, override with `--data-disk` or `$KATANA_DATA_DISK`
+- Boots with **sealed storage** by default: the data disk is wrapped in LUKS2 + dm-integrity and unlocked inside the guest via `SNP_GET_DERIVED_KEY`. The measured kernel cmdline is `console=ttyS0 KATANA_EXPECTED_LUKS_UUID=<uuid>`; the UUID is generated once per host, persisted at `~/.katana/luks-uuid`, and can be overridden with `--luks-uuid` or `$KATANA_LUKS_UUID`
+- With `--unsealed`, skips sealed storage (plain ext4 on `/dev/sda`) and keeps the cmdline at `console=ttyS0` — this produces a different (and separately pinnable) launch measurement from the sealed boot
+- Starts Katana asynchronously via a virtio-serial control channel
+- Forwards RPC port 5050 to host port 15051
+- Outputs serial log to a temp file and follows it
+
+### Manual QEMU Invocation
+
+For reference, this is roughly what `start-vm.sh` runs under the hood. The inline comments make it non-copy-pasteable; see `start-vm.sh` for the exact invocation.
 
 ```sh
 qemu-system-x86_64 \
@@ -98,8 +126,16 @@ qemu-system-x86_64 \
     -kernel output/qemu/vmlinuz \
     # Initial ramdisk containing katana (measured when kernel-hashes=on)
     -initrd output/qemu/initrd.img \
-    # Kernel command line (measured when kernel-hashes=on)
+    # Kernel command line (measured when kernel-hashes=on).
+    # Unsealed variant shown; the sealed (default) variant appends
+    # KATANA_EXPECTED_LUKS_UUID=<uuid> (see scripts/sealed-cmdline.sh)
     -append "console=ttyS0" \
+    # Data disk, attached as /dev/sda — REQUIRED, the guest init panics
+    # without it. Unsealed mode expects an ext4 filesystem on the raw disk;
+    # sealed mode expects raw (luksFormat'd on first boot) or LUKS2
+    -device virtio-scsi-pci,id=scsi0 \
+    -drive file=$HOME/.katana/data.img,format=raw,if=none,id=disk0,cache=none \
+    -device scsi-hd,drive=disk0,bus=scsi0.0 \
     # Katana control channel (used to start Katana asynchronously after boot)
     -device virtio-serial-pci,id=virtio-serial0 \
     -chardev socket,id=katanactl,path=/tmp/katana-control.sock,server=on,wait=off \
@@ -115,48 +151,36 @@ In the QEMU example above, this line defines the host-side control channel endpo
 -chardev socket,id=katanactl,path=/tmp/katana-control.sock,server=on,wait=off
 ```
 
-The `path=/tmp/katana-control.sock` value is the Unix socket file on the host.  
+The `path=/tmp/katana-control.sock` value is the Unix socket file on the host
+(`start-vm.sh` uses `/tmp/katana-tee-vm-control.<pid>.sock` and prints the path at startup).
 That socket is connected to the guest virtio-serial port:
 
 ```sh
 -device virtserialport,chardev=katanactl,name=org.katana.control.0
 ```
 
-So writes to that Unix socket become control commands inside the VM (`start`, `status`).
+So writes to that Unix socket become control commands inside the VM:
+
+| Command | Responses |
+|---------|-----------|
+| `start <comma-separated-args>` | `ok started pid=<pid>`, `err already-running pid=<pid>` |
+| `status` | `running pid=<pid>`, `stopped exit=<code>` |
 
 Example:
 
 ```sh
-# Start Katana with comma-separated CLI args
-printf 'start --http.addr,0.0.0.0,--http.port,5050,--tee,sev-snp\n' \
-  | socat - UNIX-CONNECT:/tmp/katana-control.sock
+# Start Katana with comma-separated CLI args. Keep stdin open briefly after
+# the command: if socat closes the socket as soon as stdin EOFs, QEMU drops
+# the guest's reply (the command itself still executes)
+{ printf 'start --http.addr,0.0.0.0,--http.port,5050,--tee,sev-snp\n'; sleep 2; } \
+  | socat -t 2 - UNIX-CONNECT:/tmp/katana-control.sock
 
 # Check launcher status
-printf 'status\n' | socat - UNIX-CONNECT:/tmp/katana-control.sock
+{ printf 'status\n'; sleep 2; } | socat -t 2 - UNIX-CONNECT:/tmp/katana-control.sock
 ```
 
-## Running the VM
-
-The `start-vm.sh` script provides an easy way to launch a TEE VM with SEV-SNP enabled:
-
-```sh
-# Start VM with default boot components (output/qemu/)
-sudo ./start-vm.sh
-
-# Or specify a custom boot components directory
-sudo ./start-vm.sh /path/to/boot-components
-
-# Or customize Katana runtime flags (comma-separated)
-sudo ./start-vm.sh --katana-args "--http.addr,0.0.0.0,--http.port,5050,--tee,sev-snp,--dev"
-```
-
-The script:
-- Starts QEMU with SEV-SNP confidential computing enabled
-- Uses direct kernel boot with kernel-hashes=on for attestation
-- Keeps kernel cmdline stable (`console=ttyS0`) for deterministic measurement
-- Starts Katana asynchronously via virtio-serial control channel
-- Forwards RPC port 5050 to host port 15051
-- Outputs serial log to a temp file and follows it
+The guest always pins Katana's database to the data disk mount by passing its
+own `--db-dir`, and strips any `--db-*` flags from the supplied args.
 
 ## Isolated Initrd Testing
 
@@ -170,7 +194,7 @@ Use `test-initrd.sh` for focused initrd boot validation without the full SEV-SNP
 ./scripts/test-initrd.sh --output-dir ./output/qemu --timeout 300
 ```
 
-### Launch Measurement Verification
+## Launch Measurement Verification
 
 To verify a TEE VM's integrity, compute the expected launch measurement using `snp-digest`:
 
@@ -178,31 +202,38 @@ To verify a TEE VM's integrity, compute the expected launch measurement using `s
 # Build the SNP tools
 cargo build -p snp-tools
 
-# Compute expected measurement matching start-vm.sh configuration
+# Sealed boot (start-vm.sh default): the measured cmdline carries the
+# per-host LUKS UUID from ~/.katana/luks-uuid
 ./target/debug/snp-digest \
     --ovmf output/qemu/OVMF.fd \
     --kernel output/qemu/vmlinuz \
     --initrd output/qemu/initrd.img \
-    --append "console=ttyS0" \
+    --append "console=ttyS0 KATANA_EXPECTED_LUKS_UUID=$(cat ~/.katana/luks-uuid)" \
     --vcpus 1 \
     --cpu epyc-v4 \
     --vmm qemu \
     --guest-features 0x1
+
+# Unsealed boot (start-vm.sh --unsealed): same command with
+#   --append "console=ttyS0"
 ```
 
+`start-vm.sh` prints the exact `snp-digest` command for its configuration at startup.
 The computed measurement should match the `measurement` field in the attestation report.
 
-### Decoding Attestation Reports
+## Decoding Attestation Reports
 
 Katana running inside a TEE exposes an RPC endpoint to retrieve attestation reports:
 
 ```sh
 curl -X POST http://localhost:15051 \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tee_generatQuote","params":[]}'
+  -d '{"jsonrpc":"2.0","id":1,"method":"tee_generateQuote","params":[null,0]}'
 ```
 
-Example response:
+Params are `[prevBlockId, blockId]`; pass `null` as `prevBlockId` for the genesis block.
+
+Example response (abridged — the exact field set depends on the Katana version):
 ```json
 {
   "jsonrpc": "2.0",
@@ -238,7 +269,7 @@ The output includes:
 - **Report Data**: User-provided data included in the report
 - **Signature**: ECDSA signature for verification
 
-### OVMF Metadata Inspection
+## OVMF Metadata Inspection
 
 Use `ovmf-metadata` to inspect the OVMF firmware's SEV metadata sections:
 
@@ -251,8 +282,11 @@ Use `ovmf-metadata` to inspect the OVMF firmware's SEV metadata sections:
 Set `SOURCE_DATE_EPOCH` for deterministic output:
 
 ```sh
-SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) ./build.sh
+SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) ./build.sh --katana /path/to/katana
 ```
+
+If unset, `build.sh` warns loudly and falls back to the current wall-clock time
+(non-reproducible).
 
 ## Troubleshooting
 
