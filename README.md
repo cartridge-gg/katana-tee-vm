@@ -85,6 +85,9 @@ sudo ./start-vm.sh /path/to/boot-components
 # Or customize Katana runtime flags (comma-separated)
 sudo ./start-vm.sh --katana-args "--http.addr,0.0.0.0,--http.port,5050,--tee,sev-snp,--dev"
 
+# Or pass a chain config directory (forwarded to Katana as --chain)
+sudo ./start-vm.sh --chain-dir /path/to/chain-config
+
 # Or boot without starting Katana (drive the control channel manually)
 sudo ./start-vm.sh --no-start
 ```
@@ -95,7 +98,8 @@ The script:
 - Creates (on first run) and attaches a persistent data disk as `/dev/sda` — default `~/.katana/data.img`, override with `--data-disk` or `$KATANA_DATA_DISK`
 - Boots with **sealed storage** by default: the data disk is wrapped in LUKS2 + dm-integrity and unlocked inside the guest via `SNP_GET_DERIVED_KEY`. The measured kernel cmdline is `console=ttyS0 KATANA_EXPECTED_LUKS_UUID=<uuid>`; the UUID is generated once per host, persisted at `~/.katana/luks-uuid`, and can be overridden with `--luks-uuid` or `$KATANA_LUKS_UUID`
 - With `--unsealed`, skips sealed storage (plain ext4 on `/dev/sda`) and keeps the cmdline at `console=ttyS0` — this produces a different (and separately pinnable) launch measurement from the sealed boot
-- Starts Katana asynchronously via a virtio-serial control channel
+- Delivers Katana's launch configuration via QEMU fw_cfg entries: CLI args at `opt/org.katana/args` and the optional `--chain-dir` contents at `opt/org.katana/chain/<file>`. fw_cfg blobs are read by the guest at runtime and are **not** part of the launch measurement, so changing args or chain config does not change the measured boot. The guest treats them as untrusted operator input and strips flags init owns (`--db-*`, `--data-dir`, `--chain`)
+- Starts Katana asynchronously via a virtio-serial control channel (`start` takes no arguments — config comes from fw_cfg)
 - Forwards RPC port 5050 to host port 15051
 - Outputs serial log to a temp file and follows it
 
@@ -140,6 +144,12 @@ qemu-system-x86_64 \
     -device virtio-serial-pci,id=virtio-serial0 \
     -chardev socket,id=katanactl,path=/tmp/katana-control.sock,server=on,wait=off \
     -device virtserialport,chardev=katanactl,name=org.katana.control.0 \
+    # Katana launch configuration via fw_cfg — read by the guest at runtime,
+    # NOT part of the launch measurement. CLI args are one-per-line in the
+    # args file; each chain config file becomes its own entry and the guest
+    # passes the materialized directory to Katana as --chain
+    -fw_cfg name=opt/org.katana/args,file=/path/to/katana-args.txt \
+    -fw_cfg name=opt/org.katana/chain/manifest.json,file=/path/to/chain/manifest.json \
     ..
 ```
 
@@ -163,24 +173,29 @@ So writes to that Unix socket become control commands inside the VM:
 
 | Command | Responses |
 |---------|-----------|
-| `start <comma-separated-args>` | `ok started pid=<pid>`, `err already-running pid=<pid>` |
+| `start` | `ok started pid=<pid>`, `err already-running pid=<pid>`, `err start-takes-no-args …` |
 | `status` | `running pid=<pid>`, `stopped exit=<code>` |
+
+`start` takes no arguments: Katana's CLI args and chain config are read once
+at boot from the fw_cfg entries supplied at QEMU launch. A `start` with a
+payload (the old `start <comma-separated-args>` protocol) is rejected.
 
 Example:
 
 ```sh
-# Start Katana with comma-separated CLI args. Keep stdin open briefly after
-# the command: if socat closes the socket as soon as stdin EOFs, QEMU drops
-# the guest's reply (the command itself still executes)
-{ printf 'start --http.addr,0.0.0.0,--http.port,5050,--tee,sev-snp\n'; sleep 2; } \
-  | socat -t 2 - UNIX-CONNECT:/tmp/katana-control.sock
+# Start Katana. Keep stdin open briefly after the command: if socat closes
+# the socket as soon as stdin EOFs, QEMU drops the guest's reply (the
+# command itself still executes)
+{ printf 'start\n'; sleep 2; } | socat -t 2 - UNIX-CONNECT:/tmp/katana-control.sock
 
 # Check launcher status
 { printf 'status\n'; sleep 2; } | socat -t 2 - UNIX-CONNECT:/tmp/katana-control.sock
 ```
 
 The guest always pins Katana's database to the data disk mount by passing its
-own `--db-dir`, and strips any `--db-*` flags from the supplied args.
+own `--db-dir`, materializes the fw_cfg chain config at an ephemeral path it
+passes as `--chain`, and strips `--db-*` / `--data-dir` / `--chain` from the
+fw_cfg-supplied args.
 
 ## Isolated Initrd Testing
 
