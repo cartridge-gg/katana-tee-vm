@@ -242,15 +242,26 @@ then recomputes the launch measurement from the artifacts + the recorded
 `LUKS_UUID` (via the shared `sealed-cmdline.sh`) and compares it to the
 recorded `LAUNCH_MEASUREMENT`. Exit code is non-zero on any mismatch.
 
-Full from-source reproduction is also possible: check out the release tag,
-set `SOURCE_DATE_EPOCH` to the value recorded in `build-info.txt`, and run
-`./build.sh --katana <same katana binary>`. This reproduces every artifact,
-including ones the release inherited via artifact reuse (`*_REUSED_FROM`
+Full **from-source reproduction** is one command:
+
+```sh
+git fetch --tags && git checkout <tag>
+./reproduce-release.sh <tag>
+```
+
+`reproduce-release.sh` downloads the release's published `build-info.txt` and
+the exact katana binary it embedded (verified against the recorded
+`KATANA_BINARY_SHA256`), rebuilds OVMF + kernel + initrd from source with the
+recorded `SOURCE_DATE_EPOCH`, and then runs `verify-build.sh` against the
+**published** provenance — so exit code 0 means the bytes you built yourself
+match the release and hash to the published launch measurement. This works
+identically for artifacts the release inherited via reuse (`*_REUSED_FROM`
 markers): OVMF derives its own epoch from the pinned commit, so it rebuilds
-byte-identically from any tag checkout. The one caveat is the OVMF toolchain
-— EDK2 output depends on the gcc/nasm/iasl versions, so reproduce on the
-same OS image the release used (`ubuntu-latest` at build time) for an exact
-byte match.
+byte-identically from any tag checkout.
+
+The one caveat is the OVMF toolchain — EDK2 output depends on the gcc/nasm/
+iasl versions, so reproduce on the same OS image the release used
+(`ubuntu-latest` at build time) for an exact byte match.
 
 ## Runbook
 
