@@ -73,24 +73,46 @@ cargo build -p snp-tools
 
 ## Running
 
-`start-vm.sh` launches a TEE VM with SEV-SNP enabled and starts Katana inside it:
+`start-vm.sh` launches a TEE VM with SEV-SNP enabled and starts Katana inside it.
+The three measured boot components (OVMF, kernel, initrd) are **required** and
+named explicitly — there is no default boot directory:
 
 ```sh
-# Start VM with default boot components (output/qemu/)
-sudo ./start-vm.sh
+# Minimal boot — points at a fresh build under output/qemu/
+sudo ./start-vm.sh \
+  --ovmf   output/qemu/OVMF.fd \
+  --kernel output/qemu/vmlinuz \
+  --initrd output/qemu/initrd.img
 
-# Or specify a custom boot components directory
-sudo ./start-vm.sh /path/to/boot-components
+# Same boot, also customizing Katana runtime flags (comma-separated)
+sudo ./start-vm.sh \
+  --ovmf   output/qemu/OVMF.fd \
+  --kernel output/qemu/vmlinuz \
+  --initrd output/qemu/initrd.img \
+  --katana-args "--http.addr,0.0.0.0,--http.port,5050,--tee,sev-snp,--dev"
 
-# Or customize Katana runtime flags (comma-separated)
-sudo ./start-vm.sh --katana-args "--http.addr,0.0.0.0,--http.port,5050,--tee,sev-snp,--dev"
+# Or passing a chain config directory (forwarded to Katana as --chain via a
+# read-only virtio-blk ext2 disk packed from the dir contents at boot)
+sudo ./start-vm.sh \
+  --ovmf   output/qemu/OVMF.fd \
+  --kernel output/qemu/vmlinuz \
+  --initrd output/qemu/initrd.img \
+  --chain-dir /path/to/chain-config
 
-# Or pass a chain config directory (forwarded to Katana as --chain)
-sudo ./start-vm.sh --chain-dir /path/to/chain-config
-
-# Or boot without starting Katana (drive the control channel manually)
-sudo ./start-vm.sh --no-start
+# Or booting without starting Katana (drive the control channel manually)
+sudo ./start-vm.sh \
+  --ovmf   output/qemu/OVMF.fd \
+  --kernel output/qemu/vmlinuz \
+  --initrd output/qemu/initrd.img \
+  --no-start
 ```
+
+Why explicit instead of a default dir: each of OVMF / vmlinuz / initrd is hashed
+into the SEV-SNP launch measurement, so the operator's intent about which exact
+file ends up in the digest should be visible at the invocation site, not hidden
+behind a filename + colocation convention. It also makes reproducibility audits
+(swap one file against an otherwise-pinned set) tractable without symlink
+choreography on the host.
 
 The script:
 - Starts QEMU with SEV-SNP confidential computing enabled
@@ -98,8 +120,12 @@ The script:
 - Creates (on first run) and attaches a persistent data disk as `/dev/sda` — default `~/.katana/data.img`, override with `--data-disk` or `$KATANA_DATA_DISK`
 - Boots with **sealed storage** by default: the data disk is wrapped in LUKS2 + dm-integrity and unlocked inside the guest via `SNP_GET_DERIVED_KEY`. The measured kernel cmdline is `console=ttyS0 KATANA_EXPECTED_LUKS_UUID=<uuid>`; the UUID is generated once per host, persisted at `~/.katana/luks-uuid`, and can be overridden with `--luks-uuid` or `$KATANA_LUKS_UUID`
 - With `--unsealed`, skips sealed storage (plain ext4 on `/dev/sda`) and keeps the cmdline at `console=ttyS0` — this produces a different (and separately pinnable) launch measurement from the sealed boot
-- Delivers Katana's launch configuration via QEMU fw_cfg entries: CLI args at `opt/org.katana/args` and the optional `--chain-dir` contents at `opt/org.katana/chain/<file>`. fw_cfg blobs are read by the guest at runtime and are **not** part of the launch measurement, so changing args or chain config does not change the measured boot. The guest treats them as untrusted operator input and strips flags init owns (`--db-*`, `--data-dir`, `--chain`)
-- Starts Katana asynchronously via a virtio-serial control channel (`start` takes no arguments — config comes from fw_cfg)
+- Delivers Katana's launch configuration via two host-supplied boot-time channels — neither is part of the launch measurement, so changing args or chain config does not change the measured boot:
+  - **CLI args via QEMU fw_cfg** at `opt/org.katana/args`. Small payload; fw_cfg's port-I/O sysfs path is fine here.
+  - **Chain config via a read-only virtio-blk ext2 disk** built from `--chain-dir` and attached at boot; the guest mounts it at `/run/katana-chain` and passes it to Katana as `--chain`. This used to ride fw_cfg too, but the upstream `qemu_fw_cfg` driver re-reads the whole blob on every sysfs read, making it O(blob²) port I/O and unusable for multi-MB chain configs under SEV-SNP. virtio-blk goes through DMA (SWIOTLB bounce buffers under SNP) and finishes in milliseconds.
+  
+  The guest treats both channels as untrusted operator input and strips flags init owns (`--db-*`, `--data-dir`, `--chain`).
+- Starts Katana asynchronously via a virtio-serial control channel (`start` takes no arguments — config comes from the boot-time channels above)
 - Forwards RPC port 5050 to host port 15051
 - Outputs serial log to a temp file and follows it
 
@@ -144,12 +170,15 @@ qemu-system-x86_64 \
     -device virtio-serial-pci,id=virtio-serial0 \
     -chardev socket,id=katanactl,path=/tmp/katana-control.sock,server=on,wait=off \
     -device virtserialport,chardev=katanactl,name=org.katana.control.0 \
-    # Katana launch configuration via fw_cfg — read by the guest at runtime,
-    # NOT part of the launch measurement. CLI args are one-per-line in the
-    # args file; each chain config file becomes its own entry and the guest
-    # passes the materialized directory to Katana as --chain
+    # Katana CLI args via fw_cfg — one per line in the args file. Read by
+    # the guest at runtime, NOT part of the launch measurement.
     -fw_cfg name=opt/org.katana/args,file=/path/to/katana-args.txt \
-    -fw_cfg name=opt/org.katana/chain/manifest.json,file=/path/to/chain/manifest.json \
+    # Chain config as a read-only virtio-blk ext2 disk. start-vm.sh packs
+    # --chain-dir into a small ext2 image with mkfs.ext2 -d at boot. The
+    # guest mounts /dev/vda read-only and passes it to Katana as --chain.
+    # Also NOT part of the launch measurement.
+    -drive file=/path/to/chain.img,format=raw,if=none,id=chaincfg,readonly=on \
+    -device virtio-blk-pci,drive=chaincfg,serial=katana-chain \
     ..
 ```
 
@@ -177,8 +206,9 @@ So writes to that Unix socket become control commands inside the VM:
 | `status` | `running pid=<pid>`, `stopped exit=<code>` |
 
 `start` takes no arguments: Katana's CLI args and chain config are read once
-at boot from the fw_cfg entries supplied at QEMU launch. A `start` with a
-payload (the old `start <comma-separated-args>` protocol) is rejected.
+at boot from the host-supplied boot-time channels (fw_cfg + virtio-blk chain
+disk). A `start` with a payload (the old `start <comma-separated-args>`
+protocol) is rejected.
 
 Example:
 
@@ -193,9 +223,9 @@ Example:
 ```
 
 The guest always pins Katana's database to the data disk mount by passing its
-own `--db-dir`, materializes the fw_cfg chain config at an ephemeral path it
-passes as `--chain`, and strips `--db-*` / `--data-dir` / `--chain` from the
-fw_cfg-supplied args.
+own `--db-dir`, mounts the host-supplied chain config disk read-only at
+`/run/katana-chain` and passes that as `--chain`, and strips `--db-*` /
+`--data-dir` / `--chain` from the host-supplied args.
 
 ## Isolated Initrd Testing
 
@@ -209,7 +239,60 @@ Use `test-initrd.sh` for focused initrd boot validation without the full SEV-SNP
 ./scripts/test-initrd.sh --output-dir ./output/qemu --timeout 300
 ```
 
-## Launch Measurement Verification
+## Launch Measurement
+
+The launch measurement is a SHA-384 digest computed by the AMD Secure Processor
+over the guest's entire initial state at launch. It is the root of trust for
+this project, in two ways:
+
+1. **Attestation** — the digest is signed into every SEV-SNP attestation
+   report, so a remote verifier can confirm exactly which firmware, kernel,
+   initrd, and cmdline the VM booted.
+2. **Sealed storage** — the disk-unsealing key is derived inside the guest via
+   `SNP_GET_DERIVED_KEY` bound to `MEASUREMENT | GUEST_POLICY`, so changing any
+   measured byte produces a different key and the existing data disk no longer
+   unseals.
+
+Each release publishes its measurement as `launch-measurement-<tag>.txt`,
+computed against the canonical `KATANA_CANONICAL_LUKS_UUID` from `build-config`.
+
+### What is measured
+
+| Input | Source | How it enters the digest |
+|---|---|---|
+| OVMF firmware (`OVMF.fd`) | AMD's fork, pinned commit in `build-config` | Entire firmware image as loaded into guest memory |
+| Kernel (`vmlinuz`) | Pinned Ubuntu kernel `.deb` | SHA-256 entry in the SEV hashes table (`kernel-hashes=on`) |
+| Initrd (`initrd.img`) | `scripts/build-initrd.sh`, reproducible | SHA-256 entry in the hashes table |
+| Kernel cmdline | `scripts/sealed-cmdline.sh` | SHA-256 entry in the hashes table |
+| vCPU count and model | `start-vm.sh`: 1 × `EPYC-v4` | Each vCPU's initial register state (VMSA) is measured |
+| Guest features | `sev-snp-guest` object: `0x1` (SNP active) | Field in the measured VMSA |
+| VMM type | QEMU | VMSA layout differs per VMM |
+
+Two points deserve emphasis:
+
+- **The initrd hash transitively pins everything inside it**: the katana
+  binary, busybox, the glibc runtime, kernel modules, cryptsetup,
+  snp-derivekey, and the init script itself — including init's security
+  behavior (pinning `--db-dir`/`--chain`, stripping reserved flags from
+  operator input). Because the initrd build is reproducible (see
+  [Reproducible Builds](#reproducible-builds)), anyone can rebuild it from
+  source and arrive at the same hash.
+- **The cmdline has two pinnable variants**: sealed boot measures
+  `console=ttyS0 KATANA_EXPECTED_LUKS_UUID=<uuid>`; unsealed boot measures
+  `console=ttyS0`. They produce different digests — verifiers must pin the
+  sealed variant for production use and treat the LUKS UUID as part of the
+  expected measurement.
+
+### What is deliberately NOT measured
+
+| Input | Why it stays out |
+|---|---|
+| Katana CLI args (fw_cfg `opt/org.katana/args`) and chain config (read-only virtio-blk ext2 disk built from `--chain-dir`) | Runtime operator configuration — changing args or chain spec must not re-key the sealed disk or invalidate pinned measurements. The guest treats both channels as untrusted and strips flags init owns (`--db-*`, `--data-dir`, `--chain`). A verifier therefore cannot tell from the report alone which args/chain config Katana runs with. |
+| Data disk contents | Protected by a different mechanism: LUKS2 + dm-integrity, with the key derived from the measurement itself — only the measured image can unseal the disk. |
+| Guest policy (`0x30000`) | Not an input to the digest, but signed as its own field in the attestation report; verifiers must check it alongside the measurement (it gates debug access and SMT). |
+| Host software (QEMU, host kernel, hypervisor) | Untrusted by design under SEV-SNP — the hardware attests the guest without trusting the host. |
+
+### Verifying a measurement
 
 To verify a TEE VM's integrity, compute the expected launch measurement using `snp-digest`:
 

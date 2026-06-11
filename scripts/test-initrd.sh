@@ -5,11 +5,19 @@
 #
 # Runs a focused initrd boot smoke test without requiring the full SEV-SNP
 # launch path. Uses plain QEMU (no OVMF/SEV), delivers Katana's CLI args via
-# fw_cfg (opt/org.katana/args, same mechanism as start-vm.sh), starts Katana
-# through the async control channel, and validates RPC readiness. Along the
-# way it asserts the control-channel protocol contract: a `start` with a
-# payload is rejected (config comes from fw_cfg), unknown commands error,
-# a rejected start does not launch Katana, and a duplicate start is refused.
+# fw_cfg (opt/org.katana/args, same mechanism as start-vm.sh), packs a
+# synthetic chain config dir into a read-only virtio-blk ext2 disk, starts
+# Katana through the async control channel, and validates RPC readiness.
+# Along the way it asserts the control-channel protocol contract: a
+# `start` with a payload is rejected (config comes from fw_cfg), unknown
+# commands error, a rejected start does not launch Katana, and a duplicate
+# start is refused.
+#
+# Also asserts a tight time budget on the "Chain config disk mounted" log
+# line — a regression test guarding against reverting chain delivery back to
+# fw_cfg (under SEV-SNP that would wedge the guest for >10 minutes; even on
+# plain KVM the slow path takes minutes). See the rationale comment in
+# scripts/build-initrd.sh ("Install QEMU fw_cfg Kernel Module").
 #
 # Usage:
 #   ./test-initrd.sh [OPTIONS]
@@ -22,8 +30,10 @@
 #   -h, --help            Show usage
 #
 # Environment:
-#   QEMU_BIN         Optional path to qemu-system-x86_64
-#   TEST_DISK_SIZE   Ephemeral test disk size (default: 1G)
+#   QEMU_BIN                    Optional path to qemu-system-x86_64
+#   TEST_DISK_SIZE              Ephemeral test disk size (default: 1G)
+#   CHAIN_CONFIG_GENESIS_SIZE   Synthetic genesis size for chain-disk regression
+#                               test (default: 18M, matching production)
 # ==============================================================================
 
 set -euo pipefail
@@ -36,12 +46,25 @@ HOST_RPC_PORT=15052
 VM_RPC_PORT=5050
 BOOT_TIMEOUT=90
 TEST_DISK_SIZE="${TEST_DISK_SIZE:-1G}"
+# Size of the synthetic genesis.json used by the chain-disk regression check.
+# Matches production CARTRIDGE_SEPOLIA's genesis size (~18 MB) so the test
+# would catch a regression to fw_cfg-based chain delivery, where this would
+# stall the guest for >10 minutes due to the quadratic sysfs read pattern
+# in the upstream qemu_fw_cfg driver. See the rationale comment in
+# scripts/build-initrd.sh's "Install QEMU fw_cfg + virtio_blk" section.
+CHAIN_CONFIG_GENESIS_SIZE="${CHAIN_CONFIG_GENESIS_SIZE:-18M}"
+# Time budget for the guest's "Chain config disk mounted" log line to appear
+# after QEMU starts. virtio-blk + ext2 mount takes <1s in practice; this
+# bound catches a regression long before BOOT_TIMEOUT would.
+CHAIN_MOUNT_TIMEOUT=30
 
 TEMP_DIR="$(mktemp -d /tmp/katana-amdsev-initrd-test.XXXXXX)"
 SERIAL_LOG="${TEMP_DIR}/serial.log"
 DISK_IMG="${TEMP_DIR}/test-disk.img"
 CONTROL_SOCKET="${TEMP_DIR}/katana-control.sock"
 KATANA_ARGS_FILE="${TEMP_DIR}/katana-args.txt"
+CHAIN_DIR="${TEMP_DIR}/chain-config"
+CHAIN_IMG="${TEMP_DIR}/chain.img"
 QEMU_PID=""
 
 usage() {
@@ -73,6 +96,66 @@ die() {
 require_tool() {
     local tool="$1"
     command -v "$tool" >/dev/null 2>&1 || die "Required tool not found: $tool"
+}
+
+# Build an ext2 image at $CHAIN_IMG sized to match production
+# ($CHAIN_CONFIG_GENESIS_SIZE, default 18M) with synthetic content. We do NOT
+# put a katana-parseable chain spec here because:
+#   - this test runs against whatever katana version the workflow downloads,
+#     and the chain-spec TOML/genesis schema has shifted across katana minor
+#     releases (e.g. proof_kind landed post-v1.7);
+#   - the regression we're guarding against ("did chain delivery slip back to
+#     the slow fw_cfg path?") is signaled by the marker text in the guest
+#     init's mount log, not by katana parsing the spec successfully.
+# mount_chain_disk in build-initrd.sh treats a chain dir without config.toml
+# as "mount succeeded, no --chain to katana", which gives us the marker
+# without coupling this test to a specific katana version.
+#
+# The file is filled with /dev/urandom + conv=fsync to put incompressible
+# bytes on disk — avoids any sparse-file optimization that would mask a
+# regression to a transport whose perf scales with the *populated* byte count.
+build_chain_config_disk() {
+    require_tool mkfs.ext2
+    require_tool truncate
+    require_tool dd
+
+    mkdir -p "$CHAIN_DIR"
+    dd if=/dev/urandom of="$CHAIN_DIR/padding.bin" \
+        bs=1M count="${CHAIN_CONFIG_GENESIS_SIZE%M}" \
+        status=none conv=fsync
+
+    chain_dir_mb=$(du -sm "$CHAIN_DIR" | awk '{print $1}')
+    img_mb=$(( chain_dir_mb * 2 + 16 ))
+    truncate -s "${img_mb}M" "$CHAIN_IMG"
+    mkfs.ext2 -q -F -d "$CHAIN_DIR" -L katana-chain -E no_copy_xattrs "$CHAIN_IMG"
+    log "chain disk: ${chain_dir_mb} MB content packed into ${img_mb} MB ext2 image"
+}
+
+# Watch the serial log for "Chain config disk mounted at" within
+# $CHAIN_MOUNT_TIMEOUT seconds of QEMU starting. The whole point of this
+# test is to detect a regression to the slow fw_cfg chain delivery path —
+# which under SEV-SNP wedges the guest for >10 minutes, and on plain KVM
+# (this test) still takes minutes. virtio-blk should print this line in <1s.
+wait_for_chain_mount() {
+    local started_at marker="Chain config disk mounted at"
+    started_at=$(date +%s)
+    log "Watching serial log for: '$marker' (budget: ${CHAIN_MOUNT_TIMEOUT}s)"
+    while true; do
+        assert_qemu_running "Chain disk mount regression check failed"
+        if grep -qF "$marker" "$SERIAL_LOG" 2>/dev/null; then
+            local elapsed=$(( $(date +%s) - started_at ))
+            log "Chain disk mount: PASS (${elapsed}s)"
+            return 0
+        fi
+        if (( $(date +%s) - started_at >= CHAIN_MOUNT_TIMEOUT )); then
+            warn "Chain disk mount regression detected: '$marker' not seen in ${CHAIN_MOUNT_TIMEOUT}s"
+            warn "This likely means chain config delivery regressed to a slow path"
+            warn "(was the fw_cfg-vs-virtio-blk switch in build-initrd.sh reverted?)"
+            print_serial_output
+            die "Chain disk mount timed out — see scripts/build-initrd.sh comment block"
+        fi
+        sleep 1
+    done
 }
 
 print_serial_output() {
@@ -300,6 +383,10 @@ run_boot_smoke_test() {
     truncate -s "$TEST_DISK_SIZE" "$DISK_IMG"
     mkfs.ext4 -q -F "$DISK_IMG"
 
+    # Build a synthetic chain config disk so we exercise the virtio-blk path
+    # and can assert it mounts within the time budget (see wait_for_chain_mount).
+    build_chain_config_disk
+
     # Katana CLI args, one per line, delivered via fw_cfg (unmeasured —
     # same default invocation as start-vm.sh, including --tee sev-snp).
     # Requires a TEE-capable katana (v1.8.0-rc.1+); the CI workflow pins
@@ -332,6 +419,8 @@ run_boot_smoke_test() {
         -chardev "socket,id=katanactl,path=${CONTROL_SOCKET},server=on,wait=off" \
         -device virtserialport,chardev=katanactl,name=org.katana.control.0 \
         -fw_cfg "name=opt/org.katana/args,file=${KATANA_ARGS_FILE}" \
+        -drive "file=${CHAIN_IMG},format=raw,if=none,id=chaincfg,readonly=on" \
+        -device virtio-blk-pci,drive=chaincfg,serial=katana-chain \
         -device virtio-scsi-pci,id=scsi0 \
         -drive "file=${DISK_IMG},format=raw,if=none,id=disk0,cache=none" \
         -device scsi-hd,drive=disk0,bus=scsi0.0 \
@@ -341,6 +430,11 @@ run_boot_smoke_test() {
 
     QEMU_PID=$!
     log "QEMU started with PID $QEMU_PID"
+
+    # Regression check: the guest must mount the virtio-blk chain disk
+    # within CHAIN_MOUNT_TIMEOUT. Catches a revert to fw_cfg-based chain
+    # delivery, which under SEV-SNP would wedge here for >10 minutes.
+    wait_for_chain_mount
 
     wait_for_control_channel
     verify_control_protocol_prestart

@@ -13,8 +13,12 @@
 #                             kernel — see modules.builtin — so we don't ship it.)
 #   - glibc runtime packages: Provides dynamic linker and shared libraries
 #   - linux-modules-extra:    Contains SEV-SNP kernel modules (tsm.ko, sev-guest.ko)
-#                             and qemu_fw_cfg.ko (host-supplied launch config via
-#                             QEMU fw_cfg — see load_fw_cfg_config in the init)
+#                             and qemu_fw_cfg.ko (host-supplied Katana args via
+#                             QEMU fw_cfg — see load_fw_cfg_args in the init).
+#                             The chain config disk's virtio_blk + ext2/ext4
+#                             drivers are kernel-builtins (see modules.builtin),
+#                             so mount_chain_disk in the init can mount /dev/vda
+#                             directly without insmod.
 #
 # Sealed-storage builds also consume two pre-built static binaries —
 # `cryptsetup` and `mkfs.ext2` — supplied via the CRYPTSETUP_BINARY and
@@ -540,13 +544,33 @@ fi
 # ------------------------------------------------------------------------------
 # Install QEMU fw_cfg Kernel Module
 # ------------------------------------------------------------------------------
-# qemu_fw_cfg.ko exposes QEMU's fw_cfg device at /sys/firmware/qemu_fw_cfg.
-# The host delivers Katana's launch configuration (CLI args + chain config
-# dir) through fw_cfg entries under opt/org.katana/ — deliberately OUTSIDE
-# the SEV-SNP launch measurement, unlike the kernel cmdline. Safe under SNP:
-# the driver's read path (fw_cfg_read_blob) is pure port I/O (ioread8_rep,
-# no DMA), which the #VC handler supports. Ships in linux-modules-extra,
-# which both sealed and unsealed builds download.
+# Launch configuration is delivered through two host-supplied channels,
+# deliberately OUTSIDE the SEV-SNP launch measurement (unlike the kernel
+# cmdline). They differ only in transport, not trust posture:
+#
+#   1. fw_cfg (qemu_fw_cfg.ko, installed below) — exposes QEMU's fw_cfg
+#      device at /sys/firmware/qemu_fw_cfg. Used for the Katana CLI args
+#      (opt/org.katana/args, ~one line). Safe under SNP: the driver's read
+#      path (fw_cfg_read_blob) is pure port I/O (ioread8_rep, no DMA),
+#      which the #VC handler supports. Small payload, no perf issue.
+#
+#   2. virtio-blk (virtio_blk, built into vmlinuz — no .ko needed) — a
+#      read-only virtio-blk ext2 disk packed by start-vm.sh from
+#      --chain-dir. Used for the chain config dir (multi-MB genesis.json +
+#      config.toml). fw_cfg is unusable here: cp(1) of a sysfs binary
+#      attribute issues PAGE_SIZE reads, and the upstream qemu_fw_cfg
+#      driver re-reads the whole blob per sysfs read() — so an 18 MB blob
+#      costs O(N^2) port I/O and stalls the guest indefinitely under
+#      SEV-SNP. virtio-blk uses DMA (via SWIOTLB bounce buffers in shared
+#      memory under SNP) for linear throughput. The guest mounts the disk
+#      read-only and Katana validates the contents via its chain spec
+#      parser — same trust-but-validate posture as fw_cfg, just a
+#      different transport.
+#
+# qemu_fw_cfg ships in linux-modules-extra (installed below). virtio_blk,
+# virtio_pci, virtio_scsi, and ext4 (which also handles ext2) are all
+# kernel-builtins in the Ubuntu 6.8.0-90 generic kernel
+# (see /lib/modules/6.8.0-90-generic/modules.builtin) — no install needed.
 log_info "Installing qemu_fw_cfg kernel module"
 FIRMWARE_MODULES_DIR="$EXTRACTED_DIR/lib/modules/$KERNEL_VERSION-generic/kernel/drivers/firmware"
 install_sev_module "qemu_fw_cfg.ko" "$FIRMWARE_MODULES_DIR/qemu_fw_cfg.ko" "lib/modules/qemu_fw_cfg.ko"
@@ -871,20 +895,30 @@ KATANA_EXIT_CODE="never"
 CONTROL_PORT_NAME="org.katana.control.0"
 CONTROL_PORT_LINK="/dev/virtio-ports/org.katana.control.0"
 
-# Host-supplied launch configuration, delivered via QEMU fw_cfg (-fw_cfg in
-# start-vm.sh) and read once at boot by load_fw_cfg_config:
+# Host-supplied launch configuration, delivered via two channels (both NOT
+# part of the SEV-SNP launch measurement — operator-supplied at boot and
+# sanitized/validated before use):
 #
-#   opt/org.katana/args             whitespace-separated Katana CLI args
-#   opt/org.katana/chain/<file>     chain config dir contents; materialized
-#                                   at $KATANA_CHAIN_DIR and passed to
-#                                   Katana via --chain
+#   1. fw_cfg (-fw_cfg in start-vm.sh) — read once at boot by
+#      load_fw_cfg_args:
+#        opt/org.katana/args        whitespace-separated Katana CLI args
+#                                   (sanitized with strip_reserved_args)
 #
-# fw_cfg entries are deliberately NOT part of the SEV-SNP launch measurement
-# (only OVMF and the kernel/initrd/cmdline hashes are). They are therefore
-# operator-controlled input and sanitized with strip_reserved_args before use.
+#   2. virtio-blk readonly ext2 disk (-drive ...,readonly=on -device
+#      virtio-blk-pci in start-vm.sh) — mounted by mount_chain_disk:
+#        chain config dir          materialized at $KATANA_CHAIN_DIR and
+#                                  passed to Katana via --chain
+#
+# A virtio-blk transport is required for the chain dir: the upstream
+# qemu_fw_cfg driver re-reads the whole blob per sysfs read(), making
+# port-I/O fw_cfg O(N^2) for multi-MB blobs and unusable under SEV-SNP
+# (an 18 MB genesis takes >10 minutes).
 FW_CFG_BY_NAME="/sys/firmware/qemu_fw_cfg/by_name"
 FW_CFG_ARGS_RAW="${FW_CFG_BY_NAME}/opt/org.katana/args/raw"
-FW_CFG_CHAIN_BASE="${FW_CFG_BY_NAME}/opt/org.katana/chain"
+# start-vm.sh attaches exactly one virtio-blk device when --chain-dir is set;
+# the kernel exposes it as /dev/vda. Busybox init has no udev/mdev so
+# /dev/disk/by-id/ symlinks aren't available — we use the bare /dev/vda path.
+CHAIN_DISK="/dev/vda"
 KATANA_CHAIN_DIR="/run/katana-chain"
 KATANA_FWCFG_ARGS=""
 KATANA_CHAIN_PRESENT=0
@@ -1069,26 +1103,27 @@ strip_reserved_args() {
     echo "$OUT"
 }
 
-# Read host-supplied launch configuration from QEMU fw_cfg. Loads the
-# qemu_fw_cfg module, reads the CLI args entry, and materializes the chain
-# config entries into $KATANA_CHAIN_DIR (rootfs ramfs — ephemeral, never the
-# sealed mount, so host-controlled files don't persist across boots).
+# Read host-supplied Katana CLI args from QEMU fw_cfg. Loads the
+# qemu_fw_cfg module and reads the args entry. Small payload (one line of
+# CLI flags) so port-I/O cost is negligible. Args are filtered with
+# strip_reserved_args before use so the host can't override --data-dir /
+# --db-* / --chain (the init owns those).
 #
-# Missing module / device / entries are all non-fatal: the VM boots and
-# Katana starts with only the flags init bakes in (--db-dir, --chain).
-load_fw_cfg_config() {
+# Missing module / device / entry is non-fatal: Katana starts with only the
+# flags init bakes in (--db-dir, --chain).
+load_fw_cfg_args() {
     if [ ! -d "$FW_CFG_BY_NAME" ]; then
         if [ ! -f /lib/modules/qemu_fw_cfg.ko ]; then
-            log "WARNING: qemu_fw_cfg.ko not in initrd; no fw_cfg launch config"
+            log "WARNING: qemu_fw_cfg.ko not in initrd; no fw_cfg launch args"
             return 0
         fi
         if ! /bin/insmod /lib/modules/qemu_fw_cfg.ko; then
-            log "WARNING: insmod qemu_fw_cfg.ko failed; no fw_cfg launch config"
+            log "WARNING: insmod qemu_fw_cfg.ko failed; no fw_cfg launch args"
             return 0
         fi
     fi
     if [ ! -d "$FW_CFG_BY_NAME" ]; then
-        log "WARNING: $FW_CFG_BY_NAME missing after module load; no fw_cfg launch config"
+        log "WARNING: $FW_CFG_BY_NAME missing after module load; no fw_cfg launch args"
         return 0
     fi
 
@@ -1099,19 +1134,58 @@ load_fw_cfg_config() {
     else
         log "No fw_cfg args entry (opt/org.katana/args)"
     fi
+}
 
-    for raw in "$FW_CFG_CHAIN_BASE"/*/raw; do
-        [ -f "$raw" ] || continue
-        ENTRY_DIR="${raw%/raw}"
-        CHAIN_FILE_NAME="${ENTRY_DIR##*/}"
-        mkdir -p "$KATANA_CHAIN_DIR"
-        cp "$raw" "$KATANA_CHAIN_DIR/$CHAIN_FILE_NAME"
-        KATANA_CHAIN_PRESENT=1
-        log "fw_cfg chain file: $CHAIN_FILE_NAME"
+# Mount the host-supplied chain config disk read-only at $KATANA_CHAIN_DIR.
+# The disk is a small ext2 image packed by start-vm.sh from --chain-dir and
+# attached as a virtio-blk device. virtio_blk + ext4 (which handles ext2)
+# are kernel-builtins in the Ubuntu 6.8.0-90 generic kernel — no insmod
+# needed; the device shows up automatically once the virtio bus is probed.
+#
+# Missing device is non-fatal — Katana starts without --chain.
+mount_chain_disk() {
+    # virtio-blk device probe is async — busybox init has no udev/mdev to
+    # populate /dev/disk/by-id, so we poll the underlying /dev/vd* device
+    # appearing after virtio bus enumeration. Up to ~5s.
+    waited=0
+    while [ "$waited" -lt 50 ]; do
+        # The first virtio-blk device shows up as /dev/vda. start-vm.sh attaches
+        # exactly one virtio-blk device when --chain-dir is provided.
+        if [ -b "$CHAIN_DISK" ]; then
+            break
+        fi
+        sleep 0.1
+        waited=$((waited + 1))
     done
-    if [ "$KATANA_CHAIN_PRESENT" -eq 0 ]; then
-        log "No fw_cfg chain config entries (opt/org.katana/chain/*)"
+    if [ ! -b "$CHAIN_DISK" ]; then
+        log "No $CHAIN_DISK after virtio_blk load — no chain config disk attached"
+        return 0
     fi
+
+    mkdir -p "$KATANA_CHAIN_DIR"
+    # ext2 is supported by the kernel for the sealed-mount path already
+    # (mkfs.ext2 + mount -t ext2 on /dev/mapper/...), so we know it's loaded.
+    if ! /bin/mount -t ext2 -o ro "$CHAIN_DISK" "$KATANA_CHAIN_DIR" 2>/dev/null; then
+        log "WARNING: failed to mount $CHAIN_DISK at $KATANA_CHAIN_DIR — no chain config"
+        return 0
+    fi
+
+    chain_files=$(ls -1 "$KATANA_CHAIN_DIR" 2>/dev/null | tr '\n' ' ')
+    log "Chain config disk mounted at $KATANA_CHAIN_DIR (files: ${chain_files:-<empty>})"
+
+    # Only thread --chain to Katana if the dir contains a config.toml. Katana's
+    # rollup::read(dir) opens dir/config.toml + dir/genesis.json — without
+    # config.toml it errors out and exits. A mount without config.toml is
+    # operationally a misconfigured deploy, but treating it as "boot without
+    # --chain" lets the operator still get in and fix it. The test-initrd
+    # regression test relies on this: it attaches a chain disk with only
+    # synthetic padding (no katana-version-compatible chain spec) to exercise
+    # the mount path independently of katana's chain-spec schema.
+    if [ ! -f "$KATANA_CHAIN_DIR/config.toml" ]; then
+        log "WARNING: $KATANA_CHAIN_DIR has no config.toml — Katana will boot without --chain"
+        return 0
+    fi
+    KATANA_CHAIN_PRESENT=1
 }
 
 # Sealed-storage unlock. Called only when SEALED_MODE=1.
@@ -1294,12 +1368,13 @@ handle_control_command() {
                 return 0
             fi
 
-            # Launch configuration comes exclusively from fw_cfg, read once
-            # at boot by load_fw_cfg_config. A payload here means a stale
-            # client speaking the old `start <csv-args>` protocol — reject
-            # loudly rather than silently ignoring its args.
+            # Launch configuration comes exclusively from boot-time channels
+            # (fw_cfg args + virtio-blk chain disk), read once by init. A
+            # payload here means a stale client speaking the old
+            # `start <csv-args>` protocol — reject loudly rather than
+            # silently ignoring its args.
             if [ -n "$CMD_PAYLOAD" ]; then
-                respond_control "err start-takes-no-args (launch config comes from fw_cfg)"
+                respond_control "err start-takes-no-args (launch config comes from boot-time fw_cfg / chain disk)"
                 return 0
             fi
 
@@ -1398,9 +1473,14 @@ if [ "$TEE_DEVICE_FOUND" -eq 0 ]; then
     log "WARNING: No TEE attestation interface found"
 fi
 
-# Read host-supplied launch config (CLI args + chain config) from fw_cfg.
-log "Loading fw_cfg launch configuration..."
-load_fw_cfg_config
+# Read host-supplied launch config:
+#   - CLI args from fw_cfg (small, fast)
+#   - chain config dir from a virtio-blk readonly disk (DMA-capable; required
+#     for multi-MB blobs that fw_cfg port I/O can't handle, see header comment)
+log "Loading launch config args from fw_cfg..."
+load_fw_cfg_args
+log "Mounting chain config disk (virtio-blk)..."
+mount_chain_disk
 
 # Configure networking (QEMU user-mode defaults)
 log "Configuring network..."
