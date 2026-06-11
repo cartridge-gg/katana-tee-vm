@@ -68,7 +68,7 @@ jobs:
           # TEE-capable katana. The latest *stable* release (v1.7.1) predates
           # TEE support, and gh has no "latest including prereleases". Bump
           # when newer TEE-capable releases ship.
-          KATANA_TEST_VERSION: v1.8.0-rc.1
+          KATANA_TEST_VERSION: v1.8.0-rc.2
         run: |
           mkdir -p .katana-dl
           # katana product + portable build only (same pattern as release.yml):
