@@ -32,6 +32,11 @@ on:
         description: 'Katana release tag to bundle (used only for workflow_dispatch; e.g. v1.0.0, or "latest")'
         required: true
         default: 'latest'
+      force_rebuild:
+        description: 'Rebuild OVMF and kernel even when the previous release used identical pins'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   build:
@@ -103,8 +108,114 @@ jobs:
           fi
           echo "KATANA_BIN=$KATANA_BIN" >> "$GITHUB_ENV"
 
+      - name: Reuse OVMF/kernel from previous release when pins are unchanged
+        # Only the initrd actually changes between releases when the OVMF
+        # commit and kernel pins are untouched — and rebuilding OVMF anyway
+        # would CHANGE its bytes, because SOURCE_DATE_EPOCH (HEAD commit
+        # time) differs per release and gets embedded in the firmware. Reuse
+        # therefore both saves the ~10-minute EDK2 build and keeps the OVMF
+        # contribution to the launch measurement stable across releases:
+        # verifiers see only the initrd hash move when only katana moved.
+        # Every reused artifact is verified against the SHA-256 recorded in
+        # the previous release's build-info.txt; any mismatch or missing
+        # data falls back to a full rebuild of that component.
+        if: github.event.inputs.force_rebuild != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          . ./build-config
+
+          mkdir -p output/qemu prev-release
+          REUSE_OVMF=0
+          REUSE_KERNEL=0
+          PREV_TAG=""
+
+          # Latest published release, excluding the tag being built (relevant
+          # on re-runs after the release object already exists).
+          PREV_TAG="$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --limit 20 --json tagName --jq '.[].tagName' \
+            | grep -vFx "$GITHUB_REF_NAME" | head -n1 || true)"
+
+          if [ -z "$PREV_TAG" ]; then
+            echo "No previous release found — building all components."
+          elif ! gh release download "$PREV_TAG" --repo "$GITHUB_REPOSITORY" \
+                 --pattern "build-info-${PREV_TAG}.txt" --output prev-release/build-info.txt; then
+            echo "Previous release $PREV_TAG has no build-info — building all components."
+          else
+            echo "Previous release: $PREV_TAG"
+            info_prev() {
+              awk -F= -v k="$1" '$1 == k { sub(/^[^=]*=/, ""); print; exit }' prev-release/build-info.txt
+            }
+
+            WANT_OVMF=0
+            WANT_KERNEL=0
+            [ "$(info_prev OVMF_COMMIT)" = "$OVMF_COMMIT" ] \
+              && [ -n "$(info_prev OVMF_SHA256)" ] && WANT_OVMF=1
+            [ "$(info_prev KERNEL_VERSION)" = "$KERNEL_VERSION" ] \
+              && [ "$(info_prev KERNEL_PKG_SHA256)" = "$KERNEL_PKG_SHA256" ] \
+              && [ -n "$(info_prev KERNEL_SHA256)" ] && WANT_KERNEL=1
+
+            if [ "$WANT_OVMF" -eq 1 ] || [ "$WANT_KERNEL" -eq 1 ]; then
+              gh release download "$PREV_TAG" --repo "$GITHUB_REPOSITORY" \
+                --pattern "katana-tee-vm-${PREV_TAG}.tar.gz" --dir prev-release/
+              tar -xzf "prev-release/katana-tee-vm-${PREV_TAG}.tar.gz" -C prev-release/
+            fi
+
+            if [ "$WANT_OVMF" -eq 1 ] && [ -f prev-release/OVMF.fd ]; then
+              ACTUAL="$(sha256sum prev-release/OVMF.fd | awk '{print $1}')"
+              if [ "$ACTUAL" = "$(info_prev OVMF_SHA256)" ]; then
+                cp prev-release/OVMF.fd output/qemu/OVMF.fd
+                REUSE_OVMF=1
+                echo "Reusing OVMF.fd from $PREV_TAG (commit $OVMF_COMMIT, sha256 $ACTUAL)"
+              else
+                echo "::warning::OVMF.fd from $PREV_TAG does not match its build-info sha256 — rebuilding OVMF"
+              fi
+            fi
+
+            if [ "$WANT_KERNEL" -eq 1 ] && [ -f prev-release/vmlinuz ]; then
+              ACTUAL="$(sha256sum prev-release/vmlinuz | awk '{print $1}')"
+              if [ "$ACTUAL" = "$(info_prev KERNEL_SHA256)" ]; then
+                cp prev-release/vmlinuz output/qemu/vmlinuz
+                REUSE_KERNEL=1
+                echo "Reusing vmlinuz from $PREV_TAG (version $KERNEL_VERSION, sha256 $ACTUAL)"
+              else
+                echo "::warning::vmlinuz from $PREV_TAG does not match its build-info sha256 — rebuilding kernel"
+              fi
+            fi
+
+            # Seed build-info with the previous release's values: build.sh
+            # merges with an existing build-info.txt and only overwrites
+            # fields for components it actually builds, so the reused
+            # components keep their recorded provenance (including the
+            # OVMF_* pins and output sha256s).
+            if [ "$REUSE_OVMF" -eq 1 ] || [ "$REUSE_KERNEL" -eq 1 ]; then
+              cp prev-release/build-info.txt output/qemu/build-info.txt
+            fi
+          fi
+
+          rm -rf prev-release
+          {
+            echo "REUSE_OVMF=$REUSE_OVMF"
+            echo "REUSE_KERNEL=$REUSE_KERNEL"
+            echo "PREV_RELEASE_TAG=$PREV_TAG"
+          } >> "$GITHUB_ENV"
+
       - name: Build VM image
-        run: ./build.sh --katana "$KATANA_BIN"
+        run: |
+          COMPONENTS="initrd"
+          [ "${REUSE_KERNEL:-0}" -eq 1 ] || COMPONENTS="kernel $COMPONENTS"
+          [ "${REUSE_OVMF:-0}" -eq 1 ] || COMPONENTS="ovmf $COMPONENTS"
+          echo "Building components: $COMPONENTS"
+          # shellcheck disable=SC2086
+          ./build.sh --katana "$KATANA_BIN" $COMPONENTS
+
+          # Record artifact reuse in the build provenance (flows into the
+          # release notes via the embedded build-info.txt).
+          if [ "${REUSE_OVMF:-0}" -eq 1 ]; then
+            echo "OVMF_REUSED_FROM=$PREV_RELEASE_TAG" >> output/qemu/build-info.txt
+          fi
+          if [ "${REUSE_KERNEL:-0}" -eq 1 ]; then
+            echo "KERNEL_REUSED_FROM=$PREV_RELEASE_TAG" >> output/qemu/build-info.txt
+          fi
 
       - name: Build snp-tools
         # snp-tools binaries are NOT shipped as release artifacts (separate
