@@ -66,26 +66,26 @@ and the resulting measurement is unreproducible by anyone else.
 | Artifact | Affected? | Mechanism |
 |---|---|---|
 | `initrd.img` | **Yes** | Every file in the initrd tree gets its mtime set to the epoch (`touch -d @$SOURCE_DATE_EPOCH`, `build-initrd.sh`) before packing, and member mtimes are part of the newc cpio bytes. The gzip wrapper uses `-n` (no embedded timestamp) and `cpio --reproducible` with sorted input handles the rest, so the epoch is the *only* time-derived input to the archive bytes. The static cryptsetup/mkfs.ext2 binaries baked into the initrd are themselves built with the same epoch passed into their pinned Alpine container (`build-cryptsetup.sh`). |
-| `OVMF.fd` | **Yes** | `build.sh` exports the variable; EDK2's BaseTools read `SOURCE_DATE_EPOCH` from the environment and use it wherever they would otherwise embed the wall-clock build time in the firmware image. `build-ovmf.sh` itself never references it — the propagation is purely via the environment. |
+| `OVMF.fd` | **Yes — but from its own pin, not the release epoch** | EDK2's BaseTools read `SOURCE_DATE_EPOCH` from the environment for the timestamps they embed in the firmware. `build-ovmf.sh` deliberately *overrides* the release epoch with the pinned OVMF commit's own timestamp, so `OVMF.fd` is a pure function of (`OVMF_COMMIT`, toolchain): any checkout of any tag rebuilds byte-identical firmware. The value used is recorded as `OVMF_SOURCE_DATE_EPOCH` in `build-info.txt`. |
 | `vmlinuz` | **No** | Prebuilt Ubuntu artifact, extracted from the pinned `.deb` — its bytes are whatever Canonical shipped, regardless of epoch. |
 | `katana` | **No** | Prebuilt release binary from dojoengine/katana, downloaded as-is. |
 | `build-info.txt` | Recorded only | Carries a `SOURCE_DATE_EPOCH=` line so reproducers know which value to use; not a measured artifact. (Its `# Generated:` comment is wall-clock and intentionally outside any verification.) |
 
-Net effect: **the launch measurement depends on the epoch through `OVMF.fd`
-and `initrd.img`**. The same source tree built with the same epoch (and, for
-OVMF, the same toolchain) produces identical artifacts and an identical
-measurement; the same source tree built with a *different* epoch produces a
-different measurement even though nothing functional changed. Three pipeline
-behaviors follow directly from this:
+Net effect: **the release epoch reaches the measurement only through
+`initrd.img`** (OVMF's epoch is derived from its own pin and is stable as
+long as `OVMF_COMMIT` is). The same source tree built with the same release
+epoch — the value recorded in `build-info.txt` — produces identical artifacts
+and an identical measurement; a different release epoch changes the initrd
+bytes (and the measurement) even though nothing functional changed. Two
+pipeline behaviors follow directly from this:
 
-1. Releases pin the epoch to the HEAD commit time, so the measurement is a
-   function of the tagged commit rather than of when the workflow happened to
-   run.
-2. OVMF is *reused* across releases when its pin is unchanged (step 4) —
-   rebuilding it under a new release's epoch would shift the measurement for
-   no reason.
-3. From-source reproducers must set `SOURCE_DATE_EPOCH` to the value recorded
-   in the release's `build-info.txt`, not to their own checkout time.
+1. Releases pin the release epoch to the HEAD commit time, so the measurement
+   is a function of the tagged commit rather than of when the workflow
+   happened to run.
+2. From-source reproducers must set `SOURCE_DATE_EPOCH` to the value recorded
+   in the release's `build-info.txt`, not to their own checkout time. (OVMF
+   needs no such care — `build-ovmf.sh` derives its epoch from the pin
+   automatically.)
 
 ### 2. Install toolchain
 
@@ -110,7 +110,11 @@ Before building, the workflow looks up the most recent published release,
 downloads its `build-info-<tag>.txt`, and compares pins against the current
 `build-config`:
 
-- **OVMF** is reused when `OVMF_COMMIT` is unchanged.
+- **OVMF** is reused when `OVMF_COMMIT` is unchanged *and* the previous
+  artifact records an `OVMF_SOURCE_DATE_EPOCH` (i.e. it was built under the
+  "epoch = OVMF commit time" rule; older artifacts built with a release
+  epoch are rebuilt once rather than perpetuating bytes that no tag checkout
+  can reproduce).
 - **vmlinuz** is reused when `KERNEL_VERSION` and `KERNEL_PKG_SHA256` are
   unchanged.
 
@@ -119,17 +123,13 @@ A reused artifact is extracted from the previous release's tarball and
 before being accepted. Any mismatch, missing asset, or missing field falls
 back to rebuilding that component; `force_rebuild=true` skips reuse entirely.
 
-Reuse is a *correctness* feature, not just a ~10-minute saving:
-
-- `SOURCE_DATE_EPOCH` differs per release (it's the HEAD commit time) and is
-  embedded in the OVMF build. Rebuilding OVMF for each release would change
-  its bytes — and shift the launch measurement — even with an identical
-  pinned OVMF commit. With reuse, consecutive releases that only bump katana
-  differ **only in the initrd hash**, which is far friendlier for verifiers
-  maintaining pinned measurements.
-- It also insulates the measurement from toolchain drift on `ubuntu-latest`
-  (EDK2 output depends on the runner's gcc/nasm/iasl versions, which Ubuntu
-  updates under us).
+Because OVMF's epoch is derived from its pin, rebuilding it from the same
+pin reproduces the same bytes (given the same toolchain) — so reuse is a
+time saver (~10 minutes of EDK2 build) plus a shield against the one
+remaining nondeterminism: toolchain drift on `ubuntu-latest` (EDK2 output
+depends on the runner's gcc/nasm/iasl versions, which Ubuntu updates under
+us). Consecutive releases that only bump katana differ **only in the initrd
+hash**, which is what verifiers maintaining pinned measurements want.
 
 Reused components are recorded in the provenance as
 `OVMF_REUSED_FROM=<tag>` / `KERNEL_REUSED_FROM=<tag>`.
@@ -244,9 +244,13 @@ recorded `LAUNCH_MEASUREMENT`. Exit code is non-zero on any mismatch.
 
 Full from-source reproduction is also possible: check out the release tag,
 set `SOURCE_DATE_EPOCH` to the value recorded in `build-info.txt`, and run
-`./build.sh --katana <same katana binary>`. Components inherited via artifact
-reuse (`*_REUSED_FROM` markers) reproduce from the *referenced* release's
-recorded epoch, not the current tag's.
+`./build.sh --katana <same katana binary>`. This reproduces every artifact,
+including ones the release inherited via artifact reuse (`*_REUSED_FROM`
+markers): OVMF derives its own epoch from the pinned commit, so it rebuilds
+byte-identically from any tag checkout. The one caveat is the OVMF toolchain
+— EDK2 output depends on the gcc/nasm/iasl versions, so reproduce on the
+same OS image the release used (`ubuntu-latest` at build time) for an exact
+byte match.
 
 ## Runbook
 

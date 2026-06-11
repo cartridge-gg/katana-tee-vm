@@ -301,6 +301,7 @@ BUILD_INFO="$INSTALL_DIR/build-info.txt"
 INFO_OVMF_GIT_URL=""
 INFO_OVMF_BRANCH=""
 INFO_OVMF_COMMIT=""
+INFO_OVMF_SOURCE_DATE_EPOCH=""
 INFO_KERNEL_VERSION=""
 INFO_KERNEL_PKG_SHA256=""
 INFO_BUSYBOX_PKG_SHA256=""
@@ -322,6 +323,7 @@ if [ -f "$BUILD_INFO" ]; then
 			OVMF_GIT_URL) INFO_OVMF_GIT_URL="$value" ;;
 			OVMF_BRANCH) INFO_OVMF_BRANCH="$value" ;;
 			OVMF_COMMIT) INFO_OVMF_COMMIT="$value" ;;
+			OVMF_SOURCE_DATE_EPOCH) INFO_OVMF_SOURCE_DATE_EPOCH="$value" ;;
 			KERNEL_VERSION) INFO_KERNEL_VERSION="$value" ;;
 			KERNEL_PKG_SHA256) INFO_KERNEL_PKG_SHA256="$value" ;;
 			BUSYBOX_PKG_SHA256) INFO_BUSYBOX_PKG_SHA256="$value" ;;
@@ -345,6 +347,10 @@ if [ $BUILD_OVMF -eq 1 ]; then
 	# build-ovmf.sh checked out. Source it directly rather than re-reading a
 	# truncated short hash from a side-channel file.
 	INFO_OVMF_COMMIT="$OVMF_COMMIT"
+	# The epoch the firmware was built with — derived by build-ovmf.sh from
+	# the OVMF commit's own timestamp (NOT the release epoch) and dropped
+	# alongside the artifact.
+	[ -f "$INSTALL_DIR/ovmf-source-date-epoch.txt" ] && INFO_OVMF_SOURCE_DATE_EPOCH="$(cat "$INSTALL_DIR/ovmf-source-date-epoch.txt")"
 	[ -f "$INSTALL_DIR/OVMF.fd" ] && INFO_OVMF_SHA256="$(sha256sum "$INSTALL_DIR/OVMF.fd" | awk '{print $1}')"
 fi
 
@@ -376,6 +382,7 @@ fi
 	[ -n "$INFO_OVMF_GIT_URL" ] && echo "OVMF_GIT_URL=$INFO_OVMF_GIT_URL"
 	[ -n "$INFO_OVMF_BRANCH" ] && echo "OVMF_BRANCH=$INFO_OVMF_BRANCH"
 	[ -n "$INFO_OVMF_COMMIT" ] && echo "OVMF_COMMIT=$INFO_OVMF_COMMIT"
+	[ -n "$INFO_OVMF_SOURCE_DATE_EPOCH" ] && echo "OVMF_SOURCE_DATE_EPOCH=$INFO_OVMF_SOURCE_DATE_EPOCH"
 	[ -n "$INFO_KERNEL_VERSION" ] && echo "KERNEL_VERSION=$INFO_KERNEL_VERSION"
 	[ -n "$INFO_KERNEL_PKG_SHA256" ] && echo "KERNEL_PKG_SHA256=$INFO_KERNEL_PKG_SHA256"
 	[ -n "$INFO_BUSYBOX_PKG_SHA256" ] && echo "BUSYBOX_PKG_SHA256=$INFO_BUSYBOX_PKG_SHA256"

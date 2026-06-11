@@ -148,8 +148,16 @@ jobs:
 
             WANT_OVMF=0
             WANT_KERNEL=0
+            # OVMF reuse additionally requires the previous artifact to carry
+            # OVMF_SOURCE_DATE_EPOCH — i.e. to have been built under the
+            # "epoch = OVMF commit time" rule (build-ovmf.sh). Artifacts from
+            # before that rule were built with their release's epoch and are
+            # not reproducible from a tag checkout, so they get rebuilt once.
+            # Within the rule, an OVMF_COMMIT match implies an epoch match,
+            # because the epoch is a pure function of the commit.
             [ "$(info_prev OVMF_COMMIT)" = "$OVMF_COMMIT" ] \
-              && [ -n "$(info_prev OVMF_SHA256)" ] && WANT_OVMF=1
+              && [ -n "$(info_prev OVMF_SHA256)" ] \
+              && [ -n "$(info_prev OVMF_SOURCE_DATE_EPOCH)" ] && WANT_OVMF=1
             [ "$(info_prev KERNEL_VERSION)" = "$KERNEL_VERSION" ] \
               && [ "$(info_prev KERNEL_PKG_SHA256)" = "$KERNEL_PKG_SHA256" ] \
               && [ -n "$(info_prev KERNEL_SHA256)" ] && WANT_KERNEL=1
