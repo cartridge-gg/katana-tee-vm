@@ -61,6 +61,32 @@ pure function of *(commit, katana version, pins)* instead of *(…, wall-clock
 time)*. Without it, `build.sh` falls back to `date +%s` with a loud warning
 and the resulting measurement is unreproducible by anyone else.
 
+#### How the epoch enters each artifact
+
+| Artifact | Affected? | Mechanism |
+|---|---|---|
+| `initrd.img` | **Yes** | Every file in the initrd tree gets its mtime set to the epoch (`touch -d @$SOURCE_DATE_EPOCH`, `build-initrd.sh`) before packing, and member mtimes are part of the newc cpio bytes. The gzip wrapper uses `-n` (no embedded timestamp) and `cpio --reproducible` with sorted input handles the rest, so the epoch is the *only* time-derived input to the archive bytes. The static cryptsetup/mkfs.ext2 binaries baked into the initrd are themselves built with the same epoch passed into their pinned Alpine container (`build-cryptsetup.sh`). |
+| `OVMF.fd` | **Yes** | `build.sh` exports the variable; EDK2's BaseTools read `SOURCE_DATE_EPOCH` from the environment and use it wherever they would otherwise embed the wall-clock build time in the firmware image. `build-ovmf.sh` itself never references it — the propagation is purely via the environment. |
+| `vmlinuz` | **No** | Prebuilt Ubuntu artifact, extracted from the pinned `.deb` — its bytes are whatever Canonical shipped, regardless of epoch. |
+| `katana` | **No** | Prebuilt release binary from dojoengine/katana, downloaded as-is. |
+| `build-info.txt` | Recorded only | Carries a `SOURCE_DATE_EPOCH=` line so reproducers know which value to use; not a measured artifact. (Its `# Generated:` comment is wall-clock and intentionally outside any verification.) |
+
+Net effect: **the launch measurement depends on the epoch through `OVMF.fd`
+and `initrd.img`**. The same source tree built with the same epoch (and, for
+OVMF, the same toolchain) produces identical artifacts and an identical
+measurement; the same source tree built with a *different* epoch produces a
+different measurement even though nothing functional changed. Three pipeline
+behaviors follow directly from this:
+
+1. Releases pin the epoch to the HEAD commit time, so the measurement is a
+   function of the tagged commit rather than of when the workflow happened to
+   run.
+2. OVMF is *reused* across releases when its pin is unchanged (step 4) —
+   rebuilding it under a new release's epoch would shift the measurement for
+   no reason.
+3. From-source reproducers must set `SOURCE_DATE_EPOCH` to the value recorded
+   in the release's `build-info.txt`, not to their own checkout time.
+
 ### 2. Install toolchain
 
 `nasm`, `iasl`, `uuid-dev` (EDK2/OVMF build), `musl-tools` (static
