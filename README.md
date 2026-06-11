@@ -44,6 +44,7 @@ For reproducibility, the initrd does not copy glibc or shared libraries from the
 | `scripts/sealed-cmdline.sh` | Single source of truth for the measured kernel cmdline |
 | `scripts/test-initrd.sh` | Isolated initrd boot smoke test in plain QEMU |
 | `snp-tools/` | Cargo crate with `snp-digest`, `snp-report`, `ovmf-metadata`, `snp-derivekey` |
+| `docs/release-pipeline.md` | How releases are built, measured, and published — see [Release Pipeline](docs/release-pipeline.md) |
 
 ## SNP Tools
 
