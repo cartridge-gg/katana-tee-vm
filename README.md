@@ -209,7 +209,60 @@ Use `test-initrd.sh` for focused initrd boot validation without the full SEV-SNP
 ./scripts/test-initrd.sh --output-dir ./output/qemu --timeout 300
 ```
 
-## Launch Measurement Verification
+## Launch Measurement
+
+The launch measurement is a SHA-384 digest computed by the AMD Secure Processor
+over the guest's entire initial state at launch. It is the root of trust for
+this project, in two ways:
+
+1. **Attestation** — the digest is signed into every SEV-SNP attestation
+   report, so a remote verifier can confirm exactly which firmware, kernel,
+   initrd, and cmdline the VM booted.
+2. **Sealed storage** — the disk-unsealing key is derived inside the guest via
+   `SNP_GET_DERIVED_KEY` bound to `MEASUREMENT | GUEST_POLICY`, so changing any
+   measured byte produces a different key and the existing data disk no longer
+   unseals.
+
+Each release publishes its measurement as `launch-measurement-<tag>.txt`,
+computed against the canonical `KATANA_CANONICAL_LUKS_UUID` from `build-config`.
+
+### What is measured
+
+| Input | Source | How it enters the digest |
+|---|---|---|
+| OVMF firmware (`OVMF.fd`) | AMD's fork, pinned commit in `build-config` | Entire firmware image as loaded into guest memory |
+| Kernel (`vmlinuz`) | Pinned Ubuntu kernel `.deb` | SHA-256 entry in the SEV hashes table (`kernel-hashes=on`) |
+| Initrd (`initrd.img`) | `scripts/build-initrd.sh`, reproducible | SHA-256 entry in the hashes table |
+| Kernel cmdline | `scripts/sealed-cmdline.sh` | SHA-256 entry in the hashes table |
+| vCPU count and model | `start-vm.sh`: 1 × `EPYC-v4` | Each vCPU's initial register state (VMSA) is measured |
+| Guest features | `sev-snp-guest` object: `0x1` (SNP active) | Field in the measured VMSA |
+| VMM type | QEMU | VMSA layout differs per VMM |
+
+Two points deserve emphasis:
+
+- **The initrd hash transitively pins everything inside it**: the katana
+  binary, busybox, the glibc runtime, kernel modules, cryptsetup,
+  snp-derivekey, and the init script itself — including init's security
+  behavior (pinning `--db-dir`/`--chain`, stripping reserved flags from
+  operator input). Because the initrd build is reproducible (see
+  [Reproducible Builds](#reproducible-builds)), anyone can rebuild it from
+  source and arrive at the same hash.
+- **The cmdline has two pinnable variants**: sealed boot measures
+  `console=ttyS0 KATANA_EXPECTED_LUKS_UUID=<uuid>`; unsealed boot measures
+  `console=ttyS0`. They produce different digests — verifiers must pin the
+  sealed variant for production use and treat the LUKS UUID as part of the
+  expected measurement.
+
+### What is deliberately NOT measured
+
+| Input | Why it stays out |
+|---|---|
+| Katana CLI args and chain config (fw_cfg entries under `opt/org.katana/`) | Runtime operator configuration — changing args or chain spec must not re-key the sealed disk or invalidate pinned measurements. The guest treats fw_cfg input as untrusted and strips flags init owns (`--db-*`, `--data-dir`, `--chain`). A verifier therefore cannot tell from the report alone which args/chain config Katana runs with. |
+| Data disk contents | Protected by a different mechanism: LUKS2 + dm-integrity, with the key derived from the measurement itself — only the measured image can unseal the disk. |
+| Guest policy (`0x30000`) | Not an input to the digest, but signed as its own field in the attestation report; verifiers must check it alongside the measurement (it gates debug access and SMT). |
+| Host software (QEMU, host kernel, hypervisor) | Untrusted by design under SEV-SNP — the hardware attests the guest without trusting the host. |
+
+### Verifying a measurement
 
 To verify a TEE VM's integrity, compute the expected launch measurement using `snp-digest`:
 
