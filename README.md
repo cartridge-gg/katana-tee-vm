@@ -35,6 +35,7 @@ For reproducibility, the initrd does not copy glibc or shared libraries from the
 | `build.sh` | Orchestrator entry point — builds OVMF, kernel, initrd; writes `build-info.txt` |
 | `start-vm.sh` | Starts a TEE VM with SEV-SNP and launches Katana asynchronously (consumer-facing) |
 | `verify-build.sh` | Verifies sha256s + sealed launch measurement of a build / downloaded release |
+| `reproduce-release.sh` | Rebuilds a published release from source and compares it byte-for-byte against the published artifacts |
 | `build-config` | Pinned versions and checksums for reproducible builds |
 | `scripts/build-ovmf.sh` | Builds OVMF firmware from AMD's fork with SEV-SNP support |
 | `scripts/build-kernel.sh` | Downloads and extracts Ubuntu kernel (`vmlinuz`) |
