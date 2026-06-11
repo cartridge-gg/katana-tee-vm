@@ -1170,9 +1170,22 @@ mount_chain_disk() {
         return 0
     fi
 
-    KATANA_CHAIN_PRESENT=1
     chain_files=$(ls -1 "$KATANA_CHAIN_DIR" 2>/dev/null | tr '\n' ' ')
     log "Chain config disk mounted at $KATANA_CHAIN_DIR (files: ${chain_files:-<empty>})"
+
+    # Only thread --chain to Katana if the dir contains a config.toml. Katana's
+    # rollup::read(dir) opens dir/config.toml + dir/genesis.json — without
+    # config.toml it errors out and exits. A mount without config.toml is
+    # operationally a misconfigured deploy, but treating it as "boot without
+    # --chain" lets the operator still get in and fix it. The test-initrd
+    # regression test relies on this: it attaches a chain disk with only
+    # synthetic padding (no katana-version-compatible chain spec) to exercise
+    # the mount path independently of katana's chain-spec schema.
+    if [ ! -f "$KATANA_CHAIN_DIR/config.toml" ]; then
+        log "WARNING: $KATANA_CHAIN_DIR has no config.toml — Katana will boot without --chain"
+        return 0
+    fi
+    KATANA_CHAIN_PRESENT=1
 }
 
 # Sealed-storage unlock. Called only when SEALED_MODE=1.

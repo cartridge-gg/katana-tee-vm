@@ -98,35 +98,29 @@ require_tool() {
     command -v "$tool" >/dev/null 2>&1 || die "Required tool not found: $tool"
 }
 
-# Build a small ext2 image at $CHAIN_IMG containing a $CHAIN_DIR with realistic
-# chain config files: a tiny config.toml and a $CHAIN_CONFIG_GENESIS_SIZE
-# synthetic genesis.json. Mirrors what start-vm.sh does at boot, except start-vm.sh
-# is given a real chain dir while we synthesize one. The genesis file is filled
-# with /dev/urandom — incompressible bytes so the slow-path port-I/O test isn't
-# accidentally accelerated by a sparse-file optimization somewhere.
+# Build an ext2 image at $CHAIN_IMG sized to match production
+# ($CHAIN_CONFIG_GENESIS_SIZE, default 18M) with synthetic content. We do NOT
+# put a katana-parseable chain spec here because:
+#   - this test runs against whatever katana version the workflow downloads,
+#     and the chain-spec TOML/genesis schema has shifted across katana minor
+#     releases (e.g. proof_kind landed post-v1.7);
+#   - the regression we're guarding against ("did chain delivery slip back to
+#     the slow fw_cfg path?") is signaled by the marker text in the guest
+#     init's mount log, not by katana parsing the spec successfully.
+# mount_chain_disk in build-initrd.sh treats a chain dir without config.toml
+# as "mount succeeded, no --chain to katana", which gives us the marker
+# without coupling this test to a specific katana version.
+#
+# The file is filled with /dev/urandom + conv=fsync to put incompressible
+# bytes on disk — avoids any sparse-file optimization that would mask a
+# regression to a transport whose perf scales with the *populated* byte count.
 build_chain_config_disk() {
     require_tool mkfs.ext2
     require_tool truncate
     require_tool dd
 
     mkdir -p "$CHAIN_DIR"
-    cat >"$CHAIN_DIR/config.toml" <<'TOML'
-# synthetic test config for chain-config regression test
-[id]
-Id = "0x5445535420434841494e"
-
-[settlement.starknet]
-rpc_url = "http://test/rpc"
-core_contract = "0x0"
-block = 0
-proof_kind = "tee"
-
-[settlement.starknet.id]
-Named = "Sepolia"
-TOML
-    # Bypass /dev/random throughput limits and avoid sparse-file pitfalls:
-    # /dev/urandom with conv=fsync forces actual incompressible bytes on disk.
-    dd if=/dev/urandom of="$CHAIN_DIR/genesis.json" \
+    dd if=/dev/urandom of="$CHAIN_DIR/padding.bin" \
         bs=1M count="${CHAIN_CONFIG_GENESIS_SIZE%M}" \
         status=none conv=fsync
 
