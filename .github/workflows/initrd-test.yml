@@ -60,17 +60,22 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
 
-      - name: Download katana linux binary (latest release)
+      - name: Download katana linux binary
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Pinned rather than "latest": the smoke test passes --tee sev-snp
+          # (same default invocation as start-vm.sh), which needs a
+          # TEE-capable katana. The latest *stable* release (v1.7.1) predates
+          # TEE support, and gh has no "latest including prereleases". Bump
+          # when newer TEE-capable releases ship.
+          KATANA_TEST_VERSION: v1.8.0-rc.2
         run: |
           mkdir -p .katana-dl
           # katana product + portable build only (same pattern as release.yml):
           # the `katana_` prefix excludes the paymaster-service_* / vrf-server_*
           # tarballs that newer releases ship alongside it, and the anchored
-          # suffix excludes the `_native` variant. No tag argument: gh
-          # downloads from the latest release.
-          gh release download \
+          # suffix excludes the `_native` variant.
+          gh release download "$KATANA_TEST_VERSION" \
             --repo dojoengine/katana \
             --pattern 'katana_*_linux_amd64.tar.gz' \
             --dir .katana-dl/
