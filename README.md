@@ -73,24 +73,46 @@ cargo build -p snp-tools
 
 ## Running
 
-`start-vm.sh` launches a TEE VM with SEV-SNP enabled and starts Katana inside it:
+`start-vm.sh` launches a TEE VM with SEV-SNP enabled and starts Katana inside it.
+The three measured boot components (OVMF, kernel, initrd) are **required** and
+named explicitly — there is no default boot directory:
 
 ```sh
-# Start VM with default boot components (output/qemu/)
-sudo ./start-vm.sh
+# Minimal boot — points at a fresh build under output/qemu/
+sudo ./start-vm.sh \
+  --ovmf   output/qemu/OVMF.fd \
+  --kernel output/qemu/vmlinuz \
+  --initrd output/qemu/initrd.img
 
-# Or specify a custom boot components directory
-sudo ./start-vm.sh /path/to/boot-components
+# Same boot, also customizing Katana runtime flags (comma-separated)
+sudo ./start-vm.sh \
+  --ovmf   output/qemu/OVMF.fd \
+  --kernel output/qemu/vmlinuz \
+  --initrd output/qemu/initrd.img \
+  --katana-args "--http.addr,0.0.0.0,--http.port,5050,--tee,sev-snp,--dev"
 
-# Or customize Katana runtime flags (comma-separated)
-sudo ./start-vm.sh --katana-args "--http.addr,0.0.0.0,--http.port,5050,--tee,sev-snp,--dev"
+# Or passing a chain config directory (forwarded to Katana as --chain via a
+# read-only virtio-blk ext2 disk packed from the dir contents at boot)
+sudo ./start-vm.sh \
+  --ovmf   output/qemu/OVMF.fd \
+  --kernel output/qemu/vmlinuz \
+  --initrd output/qemu/initrd.img \
+  --chain-dir /path/to/chain-config
 
-# Or pass a chain config directory (forwarded to Katana as --chain)
-sudo ./start-vm.sh --chain-dir /path/to/chain-config
-
-# Or boot without starting Katana (drive the control channel manually)
-sudo ./start-vm.sh --no-start
+# Or booting without starting Katana (drive the control channel manually)
+sudo ./start-vm.sh \
+  --ovmf   output/qemu/OVMF.fd \
+  --kernel output/qemu/vmlinuz \
+  --initrd output/qemu/initrd.img \
+  --no-start
 ```
+
+Why explicit instead of a default dir: each of OVMF / vmlinuz / initrd is hashed
+into the SEV-SNP launch measurement, so the operator's intent about which exact
+file ends up in the digest should be visible at the invocation site, not hidden
+behind a filename + colocation convention. It also makes reproducibility audits
+(swap one file against an otherwise-pinned set) tractable without symlink
+choreography on the host.
 
 The script:
 - Starts QEMU with SEV-SNP confidential computing enabled
