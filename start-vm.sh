@@ -3,8 +3,9 @@
 # Usage: ./start-vm.sh [BOOT_COMPONENTS_DIR] [--katana-args CSV] [--chain-dir DIR] [--no-start]
 #
 # This script:
-# 1. Starts QEMU with the TEE boot components, passing Katana's launch
-#    configuration (CLI args + optional chain config dir) via fw_cfg
+# 1. Starts QEMU with the TEE boot components, passing Katana's CLI args via
+#    fw_cfg and the optional chain config dir as a read-only virtio-blk ext2
+#    disk packed from --chain-dir
 # 2. Creates and attaches a data disk as /dev/sda
 # 3. Optionally starts Katana asynchronously via a virtio-serial control channel
 # 4. Forwards RPC port to host
@@ -65,10 +66,14 @@ usage() {
     echo "  --katana-args CSV     Comma-separated Katana CLI args, delivered to the"
     echo "                        guest via QEMU fw_cfg (opt/org.katana/args). NOT part"
     echo "                        of the launch measurement."
-    echo "  --chain-dir DIR       Directory with chain config files, delivered via"
-    echo "                        fw_cfg (opt/org.katana/chain/<file>) and passed to"
-    echo "                        Katana as --chain inside the guest. NOT part of the"
-    echo "                        launch measurement."
+    echo "  --chain-dir DIR       Directory with chain config files. Packed into a"
+    echo "                        small ext2 image at boot and attached as a read-only"
+    echo "                        virtio-blk disk; the guest mounts it and passes the"
+    echo "                        mount point to Katana as --chain. fw_cfg is not used"
+    echo "                        for the chain dir because its port-I/O sysfs read"
+    echo "                        path is prohibitively slow under SEV-SNP for multi-MB"
+    echo "                        blobs (e.g., a Cartridge-Controller-enabled genesis"
+    echo "                        ~18 MB). NOT part of the launch measurement."
     echo "  --no-start            Boot VM without sending Katana start command"
     echo "  --data-disk PATH      Persistent data disk file attached as /dev/sda"
     echo "                        (default: ~/.katana/data.img, auto-created if absent)"
@@ -251,41 +256,62 @@ DISK_SIZE_MB=1024
 SERIAL_LOG="$(mktemp /tmp/katana-tee-vm-serial.XXXXXX.log)"
 
 # ------------------------------------------------------------------------------
-# Katana launch configuration via fw_cfg
+# Katana launch configuration: fw_cfg (args) + virtio-blk ext2 disk (chain dir)
 # ------------------------------------------------------------------------------
-# Delivered to the guest as QEMU fw_cfg entries (NOT part of the launch
-# measurement — see the header comment):
-#   opt/org.katana/args           CLI args, one per line
-#   opt/org.katana/chain/<file>   chain config dir contents; the guest
-#                                 materializes them and passes --chain
+# Neither channel is part of the SEV-SNP launch measurement — both are
+# operator-supplied at boot. See the header comment.
+#
+# fw_cfg carries the CLI args (one per line at opt/org.katana/args). Small
+# payload, port-I/O cost is negligible.
+#
+# The chain config dir is delivered via a read-only virtio-blk disk built
+# here from --chain-dir. fw_cfg's sysfs read path uses port I/O byte-by-byte,
+# and the upstream Linux qemu_fw_cfg driver re-reads the whole blob on every
+# sysfs read() call — so cp(1)'ing an 18 MB genesis costs O(blob_size^2)
+# port I/O and stalls the guest indefinitely under SEV-SNP. virtio-blk goes
+# through DMA, finishes the same copy in milliseconds, and uses the same
+# trust posture (host-supplied bytes, guest validates via Katana's parser).
 KATANA_ARGS_FILE="$(mktemp /tmp/katana-tee-vm-args.XXXXXX)"
 printf '%s' "$KATANA_ARGS_CSV" | tr ',' '\n' > "$KATANA_ARGS_FILE"
 FW_CFG_OPTS=(-fw_cfg "name=opt/org.katana/args,file=$KATANA_ARGS_FILE")
 
+CHAIN_IMG=""
+CHAIN_DRIVE_OPTS=()
 if [[ -n "$CHAIN_DIR" ]]; then
     if [[ ! -d "$CHAIN_DIR" ]]; then
         echo "Error: --chain-dir is not a directory: $CHAIN_DIR"
         exit 1
     fi
-    CHAIN_FILE_COUNT=0
-    for chain_file in "$CHAIN_DIR"/*; do
-        [[ -f "$chain_file" ]] || continue
-        chain_base="$(basename "$chain_file")"
-        # fw_cfg entry names are capped at 55 chars and the
-        # "opt/org.katana/chain/" prefix uses 21 of them; commas and '='
-        # would also break QEMU's -fw_cfg option parsing.
-        if [[ ! "$chain_base" =~ ^[A-Za-z0-9._-]+$ ]] || [[ "${#chain_base}" -gt 34 ]]; then
-            echo "Error: chain config filename not representable as a fw_cfg entry: $chain_base"
-            echo "  (allowed: [A-Za-z0-9._-], max 34 chars)"
-            exit 1
-        fi
-        FW_CFG_OPTS+=(-fw_cfg "name=opt/org.katana/chain/${chain_base},file=$chain_file")
-        CHAIN_FILE_COUNT=$((CHAIN_FILE_COUNT + 1))
-    done
-    if [[ "$CHAIN_FILE_COUNT" -eq 0 ]]; then
+    if ! find "$CHAIN_DIR" -mindepth 1 -maxdepth 1 -type f | grep -q .; then
         echo "Error: --chain-dir contains no regular files: $CHAIN_DIR"
         exit 1
     fi
+    if ! command -v mkfs.ext2 >/dev/null 2>&1; then
+        echo "Error: mkfs.ext2 not found on host; required to pack --chain-dir into the guest disk."
+        echo "       Install via: apt-get install -y e2fsprogs"
+        exit 1
+    fi
+
+    # Size the image as 2 * dir contents + 16 MB headroom, rounded up to MB.
+    # mkfs.ext2 itself needs ~5% overhead; doubling is generous and keeps room
+    # for future genesis growth without re-running this code.
+    CHAIN_DIR_MB=$(du -sm "$CHAIN_DIR" | awk '{print $1}')
+    CHAIN_IMG_MB=$(( CHAIN_DIR_MB * 2 + 16 ))
+    CHAIN_IMG="$(mktemp /tmp/katana-tee-vm-chain.XXXXXX.img)"
+    truncate -s "${CHAIN_IMG_MB}M" "$CHAIN_IMG"
+    # -F: force-create on a regular file. -d: populate from a host directory at
+    # format time. -L katana-chain: stable label for debug; the guest mounts by
+    # device path, not label. -E no_copy_xattrs: keep deterministic content
+    # regardless of the host's xattr config.
+    mkfs.ext2 -q -F -d "$CHAIN_DIR" -L katana-chain -E no_copy_xattrs "$CHAIN_IMG" \
+        || { echo "Error: mkfs.ext2 failed to pack $CHAIN_DIR into $CHAIN_IMG"; exit 1; }
+
+    # Attach as a read-only virtio-blk device. The guest sees it at /dev/vda
+    # and mounts it read-only at $KATANA_CHAIN_DIR.
+    CHAIN_DRIVE_OPTS=(
+        -drive "file=$CHAIN_IMG,format=raw,if=none,id=chaincfg,readonly=on"
+        -device 'virtio-blk-pci,drive=chaincfg,serial=katana-chain'
+    )
 fi
 
 show_serial_tail() {
@@ -336,6 +362,7 @@ cleanup() {
 
     [[ -f "$SERIAL_LOG" ]] && rm -f "$SERIAL_LOG"
     [[ -n "${KATANA_ARGS_FILE:-}" && -f "$KATANA_ARGS_FILE" ]] && rm -f "$KATANA_ARGS_FILE"
+    [[ -n "${CHAIN_IMG:-}" && -f "$CHAIN_IMG" ]] && rm -f "$CHAIN_IMG"
     [[ -S "$CONTROL_SOCKET" ]] && rm -f "$CONTROL_SOCKET"
     # NOTE: $DISK_IMAGE is persistent — not cleaned up.
 
@@ -427,7 +454,11 @@ echo "  Memory:         $MEMORY"
 echo "  Serial:         $SERIAL_LOG"
 echo "  Control socket: $CONTROL_SOCKET"
 echo "  Katana args:    $KATANA_ARGS_CSV (via fw_cfg, unmeasured)"
-echo "  Chain dir:      ${CHAIN_DIR:-<none>}"
+if [[ -n "$CHAIN_DIR" ]]; then
+    echo "  Chain dir:      $CHAIN_DIR -> $CHAIN_IMG (${CHAIN_IMG_MB}M ext2, ro virtio-blk, unmeasured)"
+else
+    echo "  Chain dir:      <none>"
+fi
 echo "  RPC:            localhost:$HOST_RPC_PORT -> VM:$KATANA_RPC_PORT"
 echo ""
 echo "To compute expected launch measurement:"
@@ -453,6 +484,7 @@ qemu-system-x86_64 \
     -chardev socket,id=katanactl,path="$CONTROL_SOCKET",server=on,wait=off \
     -device virtserialport,chardev=katanactl,name="$CONTROL_PORT_NAME" \
     "${FW_CFG_OPTS[@]}" \
+    "${CHAIN_DRIVE_OPTS[@]}" \
     -device virtio-scsi-pci,id=scsi0 \
     -drive file="$DISK_IMAGE",format=raw,if=none,id=disk0,cache=none \
     -device scsi-hd,drive=disk0,bus=scsi0.0 \
