@@ -1,6 +1,7 @@
 #!/bin/bash
 # Start TEE VM with AMD SEV-SNP
-# Usage: ./start-vm.sh [BOOT_COMPONENTS_DIR] [--katana-args CSV] [--chain-dir DIR] [--no-start]
+# Usage: ./start-vm.sh --ovmf PATH --kernel PATH --initrd PATH
+#                     [--katana-args CSV] [--chain-dir DIR] [--no-start] [...]
 #
 # This script:
 # 1. Starts QEMU with the TEE boot components, passing Katana's CLI args via
@@ -52,15 +53,18 @@
 set -euo pipefail
 
 usage() {
-    echo "Usage: $0 [BOOT_COMPONENTS_DIR] [--katana-args CSV] [--chain-dir DIR] [--no-start]"
+    echo "Usage: $0 --ovmf PATH --kernel PATH --initrd PATH"
+    echo "          [--katana-args CSV] [--chain-dir DIR] [--no-start]"
     echo "          [--data-disk PATH] [--luks-uuid UUID] [--unsealed]"
     echo ""
     echo "Starts a SEV-SNP VM and launches Katana asynchronously via control channel."
     echo "Sealed storage is the default — the disk is wrapped in LUKS2 + dm-integrity"
     echo "and unlocked inside the guest via SNP_GET_DERIVED_KEY."
     echo ""
-    echo "Arguments:"
-    echo "  BOOT_COMPONENTS_DIR   Optional path containing OVMF.fd, vmlinuz, initrd.img"
+    echo "Required boot components (each pinned by the SEV-SNP launch measurement):"
+    echo "  --ovmf PATH           OVMF firmware file (.fd)"
+    echo "  --kernel PATH         Linux kernel (vmlinuz)"
+    echo "  --initrd PATH         Initrd image (.img)"
     echo ""
     echo "Options:"
     echo "  --katana-args CSV     Comma-separated Katana CLI args, delivered to the"
@@ -93,7 +97,15 @@ usage() {
 }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BOOT_DIR="${SCRIPT_DIR}/output/qemu"
+# Boot components are required and named explicitly via --ovmf / --kernel /
+# --initrd. The SEV-SNP launch measurement pins each file by content hash; the
+# script doesn't infer them from a directory anymore because doing so encoded
+# a hidden contract on filenames + colocation that didn't survive a real deploy
+# (artifacts often land on different filesystems, or audits want to swap one
+# file against an otherwise-pinned set).
+OVMF_FILE=""
+KERNEL_FILE=""
+INITRD_FILE=""
 KATANA_ARGS_CSV="--http.addr,0.0.0.0,--http.port,5050,--tee,sev-snp"
 CHAIN_DIR=""
 AUTO_START_KATANA=1
@@ -105,6 +117,33 @@ UNSEALED=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --ovmf)
+            [[ $# -ge 2 ]] || {
+                echo "Error: --ovmf requires a value"
+                exit 1
+            }
+            OVMF_FILE="$2"
+            shift 2
+            ;;
+
+        --kernel)
+            [[ $# -ge 2 ]] || {
+                echo "Error: --kernel requires a value"
+                exit 1
+            }
+            KERNEL_FILE="$2"
+            shift 2
+            ;;
+
+        --initrd)
+            [[ $# -ge 2 ]] || {
+                echo "Error: --initrd requires a value"
+                exit 1
+            }
+            INITRD_FILE="$2"
+            shift 2
+            ;;
+
         --katana-args)
             [[ $# -ge 2 ]] || {
                 echo "Error: --katana-args requires a value"
@@ -164,11 +203,28 @@ while [[ $# -gt 0 ]]; do
             ;;
 
         *)
-            BOOT_DIR="$1"
-            shift
+            echo "Error: Unexpected positional argument: $1"
+            echo "       Boot components are specified via --ovmf / --kernel / --initrd."
+            echo ""
+            usage
+            exit 1
             ;;
     esac
 done
+
+# Boot components are required — every measurement-relevant input must be
+# explicitly named by the operator so a typo or missing artifact fails loudly
+# at the script level rather than producing a silently-wrong launch digest.
+missing=()
+[[ -z "$OVMF_FILE" ]]   && missing+=(--ovmf)
+[[ -z "$KERNEL_FILE" ]] && missing+=(--kernel)
+[[ -z "$INITRD_FILE" ]] && missing+=(--initrd)
+if (( ${#missing[@]} > 0 )); then
+    echo "Error: missing required boot component flag(s): ${missing[*]}"
+    echo ""
+    usage
+    exit 1
+fi
 
 # Sealed storage is canonical. Resolve the LUKS UUID unless the operator
 # explicitly opted out with --unsealed. Default: read from ~/.katana/luks-uuid,
@@ -209,10 +265,8 @@ fi
 # Launch measurement inputs (must match values documented above)
 # ------------------------------------------------------------------------------
 
-# Boot components
-OVMF_FILE="$BOOT_DIR/OVMF.fd"
-KERNEL_FILE="$BOOT_DIR/vmlinuz"
-INITRD_FILE="$BOOT_DIR/initrd.img"
+# Boot components are set by the --ovmf / --kernel / --initrd flag handlers
+# above and validated to be non-empty + readable before we get here.
 KERNEL_CMDLINE="console=ttyS0"
 
 # SEV-SNP guest configuration
