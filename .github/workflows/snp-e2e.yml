@@ -42,9 +42,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # Test with the scripts as they were at the release tag — the same
-          # pairing a verifier reproducing that release would use.
+          # The VM-side scripts (start-vm.sh and friends) come from the
+          # release tag — they must match the artifacts' CLI and boot
+          # behavior, the same pairing a verifier of that release would use.
           ref: ${{ inputs.tag || github.event.release.tag_name }}
+
+      - uses: actions/checkout@v4
+        with:
+          # The test harness comes from the WORKFLOW's ref (current main),
+          # not the tag: it can evolve (new assertions, fixes) without
+          # re-tagging releases, and it must exist even for tags that
+          # predate it.
+          path: .e2e-harness
+
+      - name: Overlay test harness onto the tagged checkout
+        run: |
+          cp .e2e-harness/scripts/test-snp-e2e.sh scripts/test-snp-e2e.sh
+          chmod +x scripts/test-snp-e2e.sh
+          rm -rf .e2e-harness
 
       - name: Set up SSH to the TEE machine
         env:
