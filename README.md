@@ -207,6 +207,14 @@ So writes to that Unix socket become control commands inside the VM:
 |---------|-----------|
 | `start` | `ok started pid=<pid>`, `err already-running pid=<pid>`, `err start-takes-no-args …` |
 | `status` | `running pid=<pid>`, `stopped exit=<code>` |
+| `stop` | `ok stopping` — then the guest tears down and powers off |
+
+`stop` is the graceful shutdown path — it stops Katana (TERM, then KILL),
+syncs and unmounts the sealed data disk, closes the LUKS mapping, and powers
+off, so recent writes are durable across restarts. `start-vm.sh` sends it
+automatically on exit before falling back to killing QEMU. Stopping the VM
+any other way is a power cut: the LUKS/dm-integrity layers survive it, but
+database state still in the guest page cache does not.
 
 `start` takes no arguments: Katana's CLI args and chain config are read once
 at boot from the host-supplied boot-time channels (fw_cfg + virtio-blk chain

@@ -77,9 +77,52 @@ fail() { echo "[snp-e2e] FAIL: $*" >&2; exit 1; }
 DISK="$WORKDIR/data.img"
 LOGS="$WORKDIR/logs"
 
-# Find the serial log path that start-vm.sh announced in its own log.
+# Find the serial log / control socket paths that start-vm.sh announced in
+# its own log.
 serial_log_of() {
     awk -F': *' '/^  Serial:/ { print $2; exit }' "$1"
+}
+control_socket_of() {
+    awk -F': *' '/^  Control socket:/ { print $2; exit }' "$1"
+}
+
+# Send one control command to a socket and print the first reply line.
+control_send() {
+    local sock="$1" cmd="$2"
+    { printf '%s\n' "$cmd"; sleep 2; } | socat -t 2 -T 4 - UNIX-CONNECT:"$sock" 2>/dev/null | head -n1 | tr -d '\r'
+}
+
+# Stop the VM via the guest's graceful `stop` command (flushes the database
+# to the sealed disk before poweroff), falling back for releases whose
+# initrd predates `stop`: those reply "err unknown-command" and need the
+# legacy writeback wait before a hard stop. Deliberately NO wait on the
+# graceful path — that makes boot 2 a regression test for shutdown
+# durability (stop immediately after writes; state must survive).
+stop_vm_graceful() {
+    local startlog="$1"
+    local sock reply
+    sock="$(control_socket_of "$startlog")"
+    if [[ -S "$sock" ]]; then
+        reply="$(control_send "$sock" "stop" || true)"
+        case "$reply" in
+            ok\ stopping*)
+                log "graceful stop acknowledged"
+                for _ in $(seq 1 60); do
+                    pgrep -f "[q]emu-system-x86_64.*${DISK}" >/dev/null || break
+                    sleep 1
+                done
+                ;;
+            err\ unknown-command*)
+                log "guest initrd predates the stop command — legacy 45s writeback wait"
+                sleep 45
+                ;;
+            *)
+                log "no usable reply to stop ('${reply:-<none>}') — legacy 45s writeback wait"
+                sleep 45
+                ;;
+        esac
+    fi
+    stop_vm
 }
 
 # Snapshot diagnostics before any teardown (start-vm.sh deletes its serial
@@ -298,18 +341,12 @@ fi
 # ------------------------------------------------------------------------------
 # Boot 2: reboot reseal + state persistence
 # ------------------------------------------------------------------------------
-# Give the guest time to write back its page cache before the stop. The VM
-# has no host-triggerable graceful shutdown path (init's teardown only runs
-# on a guest-side TERM, which nothing external sends; QEMU SIGTERM is a
-# power cut), so a stop right after genesis initialization can catch the
-# database before ext2 writeback (~30s) persists it — boot 2 then fails
-# with "failed to open database". Remove this once the control channel
-# grows a graceful `stop` command.
-log "Waiting 45s for guest writeback before stopping the VM"
-sleep 45
-
-log "Boot 2: reboot with existing sealed disk"
-stop_vm
+# Graceful stop immediately after the writes: the guest's `stop` command
+# flushes everything to the sealed disk before poweroff, so boot 2 doubles
+# as a regression test for shutdown durability. (Releases predating `stop`
+# get the legacy 45s writeback wait inside stop_vm_graceful.)
+log "Boot 2: graceful stop, then reboot with existing sealed disk"
+stop_vm_graceful "$WORKDIR/start1.log"
 launch_vm "$WORKDIR/start2.log"
 wait_running "$WORKDIR/start2.log"
 
