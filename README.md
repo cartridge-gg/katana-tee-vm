@@ -44,6 +44,7 @@ For reproducibility, the initrd does not copy glibc or shared libraries from the
 | `scripts/build-qemu.sh` | Builds QEMU 10.2.0 from source with SEV-SNP support (operator host setup, not part of build pipeline) |
 | `scripts/sealed-cmdline.sh` | Single source of truth for the measured kernel cmdline |
 | `scripts/test-initrd.sh` | Isolated initrd boot smoke test in plain QEMU |
+| `scripts/test-snp-e2e.sh` | End-to-end test on SEV-SNP hardware: sealed boot, attestation vs expected measurement, reboot reseal |
 | `snp-tools/` | Cargo crate with `snp-digest`, `snp-report`, `ovmf-metadata`, `snp-derivekey` |
 | `docs/release-pipeline.md` | How releases are built, measured, and published — see [Release Pipeline](docs/release-pipeline.md) |
 
@@ -239,6 +240,27 @@ Use `test-initrd.sh` for focused initrd boot validation without the full SEV-SNP
 
 # Custom timeout/output directory
 ./scripts/test-initrd.sh --output-dir ./output/qemu --timeout 300
+```
+
+## End-to-End Testing on SNP Hardware
+
+On an SEV-SNP machine, `test-snp-e2e.sh` runs the full trust story as one
+command: sealed boot via `start-vm.sh`, RPC liveness, a hardware attestation
+quote compared against the expected launch measurement, and a reboot that
+must re-open the sealed disk and find the persisted chain state. The same
+script backs the `SNP E2E` CI workflow, which runs it against every published
+release.
+
+```sh
+# Test the latest published release
+sudo ./scripts/test-snp-e2e.sh
+
+# Test a specific release
+sudo ./scripts/test-snp-e2e.sh --tag katana-v1.8.0-rc.2
+
+# Test a local build before tagging (expected measurement computed with
+# snp-digest if built, otherwise the comparison is skipped with a warning)
+sudo ./scripts/test-snp-e2e.sh --boot-dir ./output/qemu
 ```
 
 ## Launch Measurement
