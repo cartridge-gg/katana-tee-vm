@@ -467,6 +467,33 @@ run_boot_smoke_test() {
     fi
 
     log "RPC check passed: $response"
+
+    # Graceful stop: the guest must acknowledge, run its teardown (visible
+    # in the serial log), and power off — which makes QEMU exit. The ack
+    # can be lost in the shutdown race (the guest closes the channel right
+    # after responding), so the authoritative signal is QEMU exiting with
+    # teardown evidence in the serial log.
+    log "Verifying graceful stop"
+    response="$(send_control_command "stop" || true)"
+    case "$response" in
+        ok\ stopping*) log "  stop acknowledged: $response" ;;
+        *)             log "  stop reply: '${response:-<none>}' (ack can be lost in shutdown race)" ;;
+    esac
+    for ((elapsed = 1; elapsed <= 60; elapsed++)); do
+        kill -0 "$QEMU_PID" 2>/dev/null || break
+        sleep 1
+    done
+    if kill -0 "$QEMU_PID" 2>/dev/null; then
+        warn "Guest did not power off within 60s of stop"
+        print_serial_output
+        die "Graceful stop failed"
+    fi
+    if ! grep -aq "Teardown: poweroff" "$SERIAL_LOG"; then
+        print_serial_output
+        die "Guest exited without running teardown (no 'Teardown: poweroff' in serial log)"
+    fi
+    log "Graceful stop OK: teardown ran, guest powered off"
+
     log "Boot smoke test passed"
 }
 

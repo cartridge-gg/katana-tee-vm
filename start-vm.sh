@@ -399,6 +399,27 @@ cleanup() {
     echo "=== Cleanup ==="
 
     if [[ -n "$QEMU_PID" ]] && kill -0 "$QEMU_PID" 2>/dev/null; then
+        # Prefer a graceful guest shutdown over killing QEMU: the `stop`
+        # control command runs the guest's teardown (katana TERM, sync,
+        # unmount, luksClose, poweroff), so writes still in the guest page
+        # cache reach the sealed data disk. Killing QEMU is a power cut —
+        # crash-safe for the LUKS/dm-integrity layers but not for database
+        # state above them. Falls through to the kill path if the guest
+        # doesn't answer (wedged, or an old initrd without `stop`).
+        if [[ -S "$CONTROL_SOCKET" ]] && command -v socat >/dev/null 2>&1; then
+            echo "Requesting graceful guest shutdown..."
+            { printf 'stop\n'; sleep 2; } | socat -t 2 -T 4 - UNIX-CONNECT:"$CONTROL_SOCKET" >/dev/null 2>&1 || true
+            for _ in $(seq 1 30); do
+                if ! kill -0 "$QEMU_PID" 2>/dev/null; then
+                    echo "Guest powered off gracefully."
+                    break
+                fi
+                sleep 1
+            done
+        fi
+    fi
+
+    if [[ -n "$QEMU_PID" ]] && kill -0 "$QEMU_PID" 2>/dev/null; then
         echo "Stopping QEMU (PID $QEMU_PID)..."
         kill "$QEMU_PID" 2>/dev/null || true
         for _ in $(seq 1 10); do
@@ -665,6 +686,7 @@ else
     echo "already delivered via fw_cfg; start takes no arguments):"
     echo "  printf 'start\n' | socat - UNIX-CONNECT:$CONTROL_SOCKET"
     echo "  printf 'status\n' | socat - UNIX-CONNECT:$CONTROL_SOCKET"
+    echo "  printf 'stop\n'   | socat - UNIX-CONNECT:$CONTROL_SOCKET   # graceful shutdown"
 fi
 
 echo ""

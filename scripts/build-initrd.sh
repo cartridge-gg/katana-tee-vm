@@ -1406,6 +1406,19 @@ handle_control_command() {
             fi
             ;;
 
+        stop)
+            # Graceful shutdown: without this, the only way to stop the VM
+            # is a host-side power cut (QEMU SIGTERM never reaches init, and
+            # busybox init has no ACPI handling), which can tear database
+            # state still sitting in the guest page cache. Acknowledge
+            # FIRST — teardown closes the control channel — then run the
+            # same teardown the TERM trap uses: stop katana (TERM, then
+            # KILL), sync, unmount /mnt/data, luksClose, poweroff. Never
+            # returns; QEMU exits on the guest poweroff.
+            respond_control "ok stopping"
+            teardown_and_halt
+            ;;
+
         "")
             ;;
 
