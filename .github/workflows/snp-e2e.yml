@@ -1,0 +1,110 @@
+name: SNP E2E
+
+# End-to-end test of a published release on real AMD SEV-SNP hardware.
+# A hosted runner SSHes into the dedicated TEE machine and runs
+# scripts/test-snp-e2e.sh there: boot the release as a sealed SNP guest,
+# assert RPC liveness, verify the hardware attestation report's measurement
+# against the published launch measurement, and prove reboot reseal + state
+# persistence.
+#
+# Security
+# --------
+# Deliberately NOT triggered by pull_request: the job holds an SSH key to
+# physical hardware, and secrets are the gate (they are unavailable to fork
+# PRs by design). A self-hosted runner was rejected for the same reason —
+# on a public repo it would let fork PRs execute code on the TEE machine.
+# The host key is pinned via a secret (no TOFU keyscan at runtime).
+#
+# The machine is a single shared resource: runs are serialized by the
+# concurrency group, never cancelled mid-flight (a cancelled run could
+# leave a VM holding the RPC port).
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to test (e.g. katana-v1.8.0-rc.2)'
+        required: true
+
+concurrency:
+  group: snp-e2e-hardware
+  cancel-in-progress: false
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TAG: ${{ inputs.tag || github.event.release.tag_name }}
+      REMOTE_BASE: /tmp/snp-e2e
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Test with the scripts as they were at the release tag — the same
+          # pairing a verifier reproducing that release would use.
+          ref: ${{ inputs.tag || github.event.release.tag_name }}
+
+      - name: Set up SSH to the TEE machine
+        env:
+          SSH_KEY: ${{ secrets.TEE_MACHINE_SSH_KEY }}
+          HOST_KEY: ${{ secrets.TEE_MACHINE_HOST_KEY }}
+          HOST: ${{ secrets.TEE_MACHINE_HOST }}
+          USER: ${{ secrets.TEE_MACHINE_USER }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/tee_ci_key
+          chmod 600 ~/.ssh/tee_ci_key
+          printf '%s\n' "$HOST_KEY" > ~/.ssh/known_hosts
+          cat > ~/.ssh/config <<EOF
+          Host tee
+            HostName $HOST
+            User $USER
+            IdentityFile ~/.ssh/tee_ci_key
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+            ConnectTimeout 15
+            ServerAliveInterval 30
+          EOF
+          ssh tee 'echo "connected to $(hostname)"'
+
+      - name: Sync checkout to the TEE machine
+        run: |
+          # shellcheck disable=SC2029  # client-side expansion intended
+          ssh tee "mkdir -p $REMOTE_BASE"
+          rsync -az --delete --exclude .git ./ "tee:$REMOTE_BASE/repo/"
+
+      - name: Run E2E test
+        run: |
+          # shellcheck disable=SC2029  # client-side expansion intended
+          ssh tee "sudo $REMOTE_BASE/repo/scripts/test-snp-e2e.sh \
+            --tag '$TAG' --workdir $REMOTE_BASE/run"
+
+      - name: Collect diagnostics
+        if: failure()
+        run: |
+          mkdir -p diagnostics
+          # The test snapshots start-vm + serial logs into run/logs on
+          # failure; chown so the runner user can read root-written files.
+          # shellcheck disable=SC2029  # client-side expansion intended
+          ssh tee "sudo chown -R \$(id -u) $REMOTE_BASE/run/logs 2>/dev/null" || true
+          scp -r "tee:$REMOTE_BASE/run/logs/*" diagnostics/ 2>/dev/null || true
+          ls -la diagnostics/ || true
+
+      - name: Upload diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: snp-e2e-diagnostics
+          path: diagnostics/
+          if-no-files-found: ignore
+
+      - name: Remote cleanup
+        if: always()
+        run: |
+          # shellcheck disable=SC2029  # client-side expansion intended
+          # Belt and braces: the test's own teardown handles the happy path;
+          # this catches wedged runs so the next one starts clean. Only
+          # touches processes/files under the snp-e2e namespace.
+          ssh tee "sudo pkill -f '[q]emu-system-x86_64.*/snp-e2e/' 2>/dev/null; sudo rm -rf $REMOTE_BASE/run" || true
