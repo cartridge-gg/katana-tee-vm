@@ -224,6 +224,16 @@ log "measurement matches published release"
 # ------------------------------------------------------------------------------
 # Boot 2: reboot reseal + state persistence
 # ------------------------------------------------------------------------------
+# Give the guest time to write back its page cache before the stop. The VM
+# has no host-triggerable graceful shutdown path (init's teardown only runs
+# on a guest-side TERM, which nothing external sends; QEMU SIGTERM is a
+# power cut), so a stop right after genesis initialization can catch the
+# database before ext2 writeback (~30s) persists it — boot 2 then fails
+# with "failed to open database". Remove this once the control channel
+# grows a graceful `stop` command.
+log "Waiting 45s for guest writeback before stopping the VM"
+sleep 45
+
 log "Boot 2: reboot with existing sealed disk"
 stop_vm
 launch_vm "$WORKDIR/start2.log"
