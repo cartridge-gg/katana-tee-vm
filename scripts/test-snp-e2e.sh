@@ -3,26 +3,27 @@
 # TEST-SNP-E2E.SH - End-to-end release test on real AMD SEV-SNP hardware
 # ==============================================================================
 #
-# Runs ON an SNP-enabled machine (invoked over SSH by the snp-e2e workflow),
-# from a checkout of this repo. Downloads a published release, boots it as a
-# sealed SEV-SNP guest via start-vm.sh, and asserts the full trust story:
+# Runs ON an SNP-enabled machine, from a checkout of this repo. Used by the
+# snp-e2e workflow over SSH, and runnable directly by anyone with SNP
+# hardware. Boots the artifacts as a sealed SEV-SNP guest via start-vm.sh
+# and asserts the full trust story:
 #
-#   1. Release artifacts match their published SHA-256s.
+#   1. Artifacts match the SHA-256s recorded in build-info.txt.
 #   2. The guest boots, Katana starts via the control channel, RPC answers.
 #   3. tee_generateQuote returns a hardware attestation report whose
-#      MEASUREMENT equals the published launch measurement and whose policy
+#      MEASUREMENT equals the expected launch measurement and whose policy
 #      is the documented 0x30000.
 #   4. Reboot reseal: a second boot opens the existing LUKS volume (no
 #      reformat) and Katana finds the already-initialized genesis — proving
 #      the sealed disk is bound to the measurement and state persists.
 #
-# Must run as root (start-vm.sh requires it; the serial log is root-owned).
+# Usage (must run as root — start-vm.sh requires it):
 #
-# Usage:
-#   sudo ./scripts/test-snp-e2e.sh --tag TAG --workdir DIR
+#   sudo ./scripts/test-snp-e2e.sh                  # latest published release
+#   sudo ./scripts/test-snp-e2e.sh --tag TAG        # a specific release
+#   sudo ./scripts/test-snp-e2e.sh --boot-dir DIR   # a local build (output/qemu)
 #
-# The workdir is created fresh; logs land in $WORKDIR/logs (collected by the
-# workflow on failure).
+# Logs land in $WORKDIR/logs on failure (collected by the CI workflow).
 # ==============================================================================
 
 set -euo pipefail
@@ -35,18 +36,40 @@ CANONICAL_LUKS_UUID="00000000-0000-0000-0000-000000000001"
 HOST_RPC="http://127.0.0.1:15051"
 BOOT_TIMEOUT=360
 TAG=""
+BOOT_DIR=""
 WORKDIR=""
 WRAPPER_PID=""
 
+usage() {
+    cat <<USAGE >&2
+Usage: sudo $0 [--tag TAG | --boot-dir DIR] [--workdir DIR]
+
+  (no arguments)    test the LATEST published release
+  --tag TAG         test a specific published release (e.g. katana-v1.8.0-rc.2)
+  --boot-dir DIR    test a LOCAL build: DIR must contain OVMF.fd, vmlinuz,
+                    initrd.img and build-info.txt (a build.sh output dir,
+                    e.g. output/qemu). Local builds have no recorded
+                    LAUNCH_MEASUREMENT; the expected value is computed with
+                    snp-digest when available, otherwise the measurement
+                    comparison is skipped with a warning.
+  --workdir DIR     scratch directory (default: mktemp under /tmp)
+USAGE
+    exit 1
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --tag)     TAG="${2:?--tag requires a value}"; shift 2 ;;
-        --workdir) WORKDIR="${2:?--workdir requires a value}"; shift 2 ;;
-        *) echo "Unknown argument: $1" >&2; exit 1 ;;
+        --tag)      TAG="${2:?--tag requires a value}"; shift 2 ;;
+        --boot-dir) BOOT_DIR="${2:?--boot-dir requires a value}"; shift 2 ;;
+        --workdir)  WORKDIR="${2:?--workdir requires a value}"; shift 2 ;;
+        -h|--help)  usage ;;
+        *) echo "Unknown argument: $1" >&2; usage ;;
     esac
 done
-[[ -n "$TAG" && -n "$WORKDIR" ]] || { echo "Usage: $0 --tag TAG --workdir DIR" >&2; exit 1; }
-[[ "$EUID" -eq 0 ]] || { echo "ERROR: must run as root" >&2; exit 1; }
+[[ -n "$TAG" && -n "$BOOT_DIR" ]] && { echo "ERROR: --tag and --boot-dir are mutually exclusive" >&2; exit 1; }
+[[ "$EUID" -eq 0 ]] || { echo "ERROR: must run as root (start-vm.sh requires it)" >&2; exit 1; }
+[[ -n "$BOOT_DIR" && ! -f "$BOOT_DIR/build-info.txt" ]] && { echo "ERROR: $BOOT_DIR is not a build output dir (no build-info.txt)" >&2; exit 1; }
+[[ -n "$WORKDIR" ]] || WORKDIR="$(mktemp -d /tmp/snp-e2e-local.XXXXXX)"
 
 log()  { echo "[snp-e2e] $*"; }
 fail() { echo "[snp-e2e] FAIL: $*" >&2; exit 1; }
@@ -108,7 +131,8 @@ for t in qemu-system-x86_64 socat curl python3 mkfs.ext4 dd; do
 done
 
 # Clean leftovers from previous runs of THIS test only, then check the port.
-pkill -f "[q]emu-system-x86_64.*/snp-e2e/" 2>/dev/null || true
+# (Matches both the CI workdir /tmp/snp-e2e/… and local /tmp/snp-e2e-local.…)
+pkill -f "[q]emu-system-x86_64.*/snp-e2e" 2>/dev/null || true
 sleep 2
 if curl -s --max-time 2 -o /dev/null "$HOST_RPC"; then
     fail "port 15051 already in use by a foreign process — refusing to continue on a shared machine"
@@ -118,24 +142,35 @@ rm -rf "$WORKDIR"
 mkdir -p "$WORKDIR" "$LOGS"
 
 # ------------------------------------------------------------------------------
-# Release artifacts
+# Boot artifacts: a local build dir, a named release, or the latest release
 # ------------------------------------------------------------------------------
-log "Downloading release $TAG"
-curl -fsSL -o "$WORKDIR/release.tar.gz" \
-    "https://github.com/${VM_REPO}/releases/download/${TAG}/katana-tee-vm-${TAG}.tar.gz" \
-    || fail "could not download release tarball for $TAG"
-mkdir -p "$WORKDIR/boot"
-tar xzf "$WORKDIR/release.tar.gz" -C "$WORKDIR/boot"
+if [[ -n "$BOOT_DIR" ]]; then
+    log "Using local build: $BOOT_DIR"
+    mkdir -p "$WORKDIR/boot"
+    for f in OVMF.fd vmlinuz initrd.img build-info.txt; do
+        [[ -f "$BOOT_DIR/$f" ]] || fail "local build dir is missing $f"
+        cp "$BOOT_DIR/$f" "$WORKDIR/boot/$f"
+    done
+    UNDER_TEST="local build $BOOT_DIR"
+else
+    if [[ -z "$TAG" ]]; then
+        log "Resolving latest release"
+        TAG="$(curl -fsSL "https://api.github.com/repos/${VM_REPO}/releases?per_page=1" \
+            | python3 -c 'import json,sys; rs=json.load(sys.stdin); print(rs[0]["tag_name"] if rs else "")')"
+        [[ -n "$TAG" ]] || fail "no published releases found in $VM_REPO"
+    fi
+    log "Downloading release $TAG"
+    curl -fsSL -o "$WORKDIR/release.tar.gz" \
+        "https://github.com/${VM_REPO}/releases/download/${TAG}/katana-tee-vm-${TAG}.tar.gz" \
+        || fail "could not download release tarball for $TAG"
+    mkdir -p "$WORKDIR/boot"
+    tar xzf "$WORKDIR/release.tar.gz" -C "$WORKDIR/boot"
+    UNDER_TEST="$TAG"
+fi
 
 BUILD_INFO="$WORKDIR/boot/build-info.txt"
-[[ -f "$BUILD_INFO" ]] || fail "release tarball has no build-info.txt"
+[[ -f "$BUILD_INFO" ]] || fail "no build-info.txt among the boot artifacts"
 info_get() { awk -F= -v k="$1" '$1 == k { sub(/^[^=]*=/, ""); print; exit }' "$BUILD_INFO"; }
-
-EXPECTED_MEASUREMENT="$(info_get LAUNCH_MEASUREMENT)"
-RELEASE_LUKS_UUID="$(info_get LUKS_UUID)"
-[[ -n "$EXPECTED_MEASUREMENT" ]] || fail "build-info has no LAUNCH_MEASUREMENT"
-[[ "$RELEASE_LUKS_UUID" == "$CANONICAL_LUKS_UUID" ]] \
-    || fail "release measurement is bound to LUKS_UUID '$RELEASE_LUKS_UUID', expected canonical '$CANONICAL_LUKS_UUID'"
 
 log "Verifying artifact checksums"
 for pair in "OVMF.fd:OVMF_SHA256" "vmlinuz:KERNEL_SHA256" "initrd.img:INITRD_SHA256"; do
@@ -144,7 +179,42 @@ for pair in "OVMF.fd:OVMF_SHA256" "vmlinuz:KERNEL_SHA256" "initrd.img:INITRD_SHA
     expected="$(info_get "$k")"
     [[ "$actual" == "$expected" ]] || fail "$f sha256 mismatch (got $actual, recorded $expected)"
 done
-log "Checksums OK; expected measurement: $EXPECTED_MEASUREMENT"
+log "Checksums OK"
+
+# Expected measurement: releases record it in build-info (bound to the
+# canonical LUKS UUID). Local builds don't — compute it with snp-digest when
+# available, otherwise skip the comparison loudly.
+MEASUREMENT_CHECK=1
+EXPECTED_MEASUREMENT="$(info_get LAUNCH_MEASUREMENT)"
+if [[ -n "$EXPECTED_MEASUREMENT" ]]; then
+    RECORDED_LUKS_UUID="$(info_get LUKS_UUID)"
+    [[ "$RECORDED_LUKS_UUID" == "$CANONICAL_LUKS_UUID" ]] \
+        || fail "recorded measurement is bound to LUKS_UUID '$RECORDED_LUKS_UUID', expected canonical '$CANONICAL_LUKS_UUID'"
+else
+    SNP_DIGEST=""
+    if command -v snp-digest >/dev/null 2>&1; then
+        SNP_DIGEST="$(command -v snp-digest)"
+    else
+        SNP_DIGEST="$(find "$REPO_DIR/snp-tools/target" -type f -name snp-digest -perm -u+x 2>/dev/null | head -n1)"
+    fi
+    if [[ -n "$SNP_DIGEST" ]]; then
+        # shellcheck source=scripts/sealed-cmdline.sh
+        . "$REPO_DIR/scripts/sealed-cmdline.sh"
+        EXPECTED_MEASUREMENT="$("$SNP_DIGEST" \
+            --ovmf="$WORKDIR/boot/OVMF.fd" \
+            --kernel="$WORKDIR/boot/vmlinuz" \
+            --initrd="$WORKDIR/boot/initrd.img" \
+            --append="$(build_sealed_cmdline "$CANONICAL_LUKS_UUID")" \
+            --vcpus=1 --cpu=epyc-v4 --vmm=qemu --guest-features=0x1)"
+        log "Computed expected measurement with snp-digest"
+    else
+        MEASUREMENT_CHECK=0
+        log "WARNING: no LAUNCH_MEASUREMENT recorded and snp-digest not found —"
+        log "WARNING: the measurement comparison will be SKIPPED. Build snp-tools"
+        log "WARNING: (cd snp-tools && cargo build --release) for the full check."
+    fi
+fi
+[[ "$MEASUREMENT_CHECK" -eq 1 ]] && log "Expected measurement: $EXPECTED_MEASUREMENT"
 
 dd if=/dev/zero of="$DISK" bs=1M count=1024 status=none
 
@@ -215,11 +285,15 @@ log "RPC OK (chainId $CHAIN_ID)"
 read -r MEASUREMENT1 POLICY1 <<< "$(quote_fields)"
 log "quote 1: measurement=$MEASUREMENT1 policy=$POLICY1"
 [[ "$POLICY1" == "0x30000" ]] || fail "unexpected guest policy: $POLICY1"
-[[ "$MEASUREMENT1" == "$EXPECTED_MEASUREMENT" ]] \
-    || fail "measurement does not match published release:
-  quote:     $MEASUREMENT1
-  published: $EXPECTED_MEASUREMENT"
-log "measurement matches published release"
+if [[ "$MEASUREMENT_CHECK" -eq 1 ]]; then
+    [[ "$MEASUREMENT1" == "$EXPECTED_MEASUREMENT" ]] \
+        || fail "measurement does not match expected:
+  quote:    $MEASUREMENT1
+  expected: $EXPECTED_MEASUREMENT"
+    log "measurement matches expected value"
+else
+    log "measurement comparison SKIPPED (no expected value available)"
+fi
 
 # ------------------------------------------------------------------------------
 # Boot 2: reboot reseal + state persistence
@@ -247,7 +321,7 @@ grep -aq "Genesis has already been initialized" "$SERIAL2" \
     || fail "boot 2 did not find the existing genesis — state did not persist"
 
 read -r MEASUREMENT2 _ <<< "$(quote_fields)"
-[[ "$MEASUREMENT2" == "$EXPECTED_MEASUREMENT" ]] || fail "boot 2 measurement drifted: $MEASUREMENT2"
+[[ "$MEASUREMENT2" == "$MEASUREMENT1" ]] || fail "boot 2 measurement drifted: $MEASUREMENT2 (boot 1: $MEASUREMENT1)"
 log "reseal OK: existing LUKS opened, genesis persisted, measurement stable"
 
 # ------------------------------------------------------------------------------
@@ -257,6 +331,7 @@ rm -rf "$WORKDIR"
 trap - EXIT
 echo ""
 echo "=========================================="
-echo "SNP E2E PASS: $TAG"
+echo "SNP E2E PASS: $UNDER_TEST"
 echo "  measurement: $MEASUREMENT1"
+[[ "$MEASUREMENT_CHECK" -eq 1 ]] || echo "  (measurement comparison was skipped — no expected value)"
 echo "=========================================="
