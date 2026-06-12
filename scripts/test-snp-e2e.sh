@@ -183,15 +183,21 @@ rpc() {
 }
 
 # Returns "measurement policy" parsed from a tee_generateQuote response.
+# The response is passed via the environment and the Python source via a
+# quoted heredoc — no shell escaping inside the Python at all (a previous
+# version used escaped quotes inside a single-quoted -c string, which reach
+# Python as literal backslashes and are a syntax error).
 quote_fields() {
-    rpc '{"jsonrpc":"2.0","id":1,"method":"tee_generateQuote","params":[null,0]}' | python3 -c '
-import json, sys
-r = json.load(sys.stdin)
+    QUOTE_JSON="$(rpc '{"jsonrpc":"2.0","id":1,"method":"tee_generateQuote","params":[null,0]}')" \
+    python3 <<'PYEOF'
+import json, os, sys
+
+r = json.loads(os.environ["QUOTE_JSON"])
 if "error" in r:
-    sys.exit(f"tee_generateQuote error: {r[\"error\"]}")
+    sys.exit("tee_generateQuote error: %s" % r["error"])
 q = bytes.fromhex(r["result"]["quote"].removeprefix("0x"))
 print(q[0x90:0x90+48].hex(), hex(int.from_bytes(q[8:16], "little")))
-'
+PYEOF
 }
 
 # ------------------------------------------------------------------------------
