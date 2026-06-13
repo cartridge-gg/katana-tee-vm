@@ -1,5 +1,15 @@
 # AMD SEV-SNP TEE Build Scripts
 
+> [!IMPORTANT]
+> **This repository has moved and is archived (read-only).**
+>
+> The Katana TEE VM tooling now lives in the main Katana monorepo at
+> [**`dojoengine/katana` → `misc/AMDSEV/`**](https://github.com/dojoengine/katana/tree/main/misc/AMDSEV).
+> All future development, issues, and releases happen there. This repository is
+> kept only as a historical reference; its releases are not migrated, so the
+> first monorepo release rebuilds from scratch and establishes a new baseline
+> launch measurement.
+
 Build scripts for creating TEE (Trusted Execution Environment) components to run Katana inside AMD SEV-SNP confidential VMs.
 
 ## Requirements
